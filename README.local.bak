@@ -1,0 +1,138 @@
+# hydro-cps-sim
+
+Hydro-CPS-Sim uses DHALSIM's `epynet` wrapper as the single hydraulic simulator. The runtime treats DHALSIM-epynet as the physical plant and no longer performs an in-run baseline comparison.
+
+## One-click run
+
+Use the case config as the only required input:
+
+```bash
+bash scripts/run_all.sh examples/c_town/config.yaml
+```
+
+`run_all.sh` requests sudo credentials once at the beginning and keeps the sudo timestamp alive while the pipeline is running. Namespace/TAP setup, OpenPLC runtime execution and the closed-loop runtime use sudo where needed. The ns-3 front-end itself is intentionally launched as the normal user, while generated TAP devices are owned by that user for TapBridge access. Do not start `./ns3` with an extra nested `sudo` command manually.
+
+This script performs the full pipeline:
+
+1. generate and validate OpenPLC ST files under `output/st/`;
+2. generate `output/network.sh` from the network section of `config.yaml`;
+3. generate `output/ns3_network.cc` using `src.network.ns3_generation`;
+4. compile each ST file into an OpenPLC executable under `output/plcs/`;
+5. create Linux namespaces, bridges, veth pairs and TAP devices;
+6. start all OpenPLC runtimes and enable Modbus/TCP;
+7. start the ns-3 TapBridge network;
+8. run the persistent closed-loop controller.
+
+Common options:
+
+```bash
+# override iterations
+bash scripts/run_all.sh examples/c_town/config.yaml --iterations 100
+
+# run offline verification automatically after the closed-loop run
+bash scripts/run_all.sh examples/c_town/config.yaml --check
+
+# reuse generated ST/network/ns-3 files and compiled PLC binaries
+bash scripts/run_all.sh examples/c_town/config.yaml --skip-prep --skip-compile
+```
+
+Useful environment variables:
+
+```bash
+PYTHON_BIN=/home/lzh/anaconda3/envs/hydro-cps/bin/python \
+NS3_START_WAIT=2 \
+CLEAN_RUNTIME=1 \
+bash scripts/run_all.sh examples/c_town/config.yaml
+```
+
+## Run only the closed loop
+
+Use this when ST files, PLC binaries, namespaces and ns-3 are already prepared:
+
+```bash
+bash scripts/run_closed_loop.sh examples/c_town/config.yaml
+```
+
+Optional:
+
+```bash
+ITERATIONS=100 PYTHON_BIN=/path/to/python bash scripts/run_closed_loop.sh
+```
+
+Runtime loop:
+
+1. write the current physics state to local PLC sensor registers;
+2. let SCADA poll PLCs and downlink cross-PLC dependency values;
+3. read PLC coil outputs as actuator execution results;
+4. apply those actuator states to DHALSIM-epynet to obtain the next physics state.
+
+The runtime does **not** check actuator correctness or run open-loop replay during execution.
+
+## Manual post-run check
+
+After the closed-loop run finishes, run:
+
+```bash
+bash scripts/check.sh examples/c_town/config.yaml
+```
+
+The checker writes all results to:
+
+```text
+examples/c_town/output/check/
+```
+
+Main check outputs:
+
+- `actuator_check.csv`: expected actuator state from `config.yaml` vs actual PLC coil output.
+- `open_loop_physics.csv`: open-loop replay physics generated from the recorded closed-loop actuator sequence.
+- `open_loop_check.csv`: closed-loop physics JSON vs open-loop replay comparison.
+- `tank_curves.csv`: closed-loop/open-loop tank values in long-table form.
+- `tank_*_closed_vs_open.png`: per-tank curve comparisons.
+- `tank_curves_closed_vs_open.png`: combined tank curve plot.
+- `actuator_*_expected_vs_actual.png`: per-actuator expected/actual state plots.
+- `actuator_states_actual.png`: compact overview of recorded actuator states.
+- `check_summary.json`: overall check result.
+
+## Runtime outputs
+
+Generated under `examples/c_town/output/runtime/`:
+
+```text
+runtime/
+  csv/
+    physics.csv       # DHALSIM-style closed-loop physics table
+    scada.csv         # SCADA poll/downlink table
+    plc_adapter.csv   # local sensor write and actuator read telemetry
+    actuator_state.csv
+    closed_loop.csv
+    bootstrap.csv
+  json/
+    physics_XXXX.json
+    actuator_state_XXXX.json
+    local_write_XXXX_plcX.json
+    actuators_XXXX_plcX.json
+    scada_poll_XXXX.json
+    scada_downlink_XXXX.json
+    closed_loop_summary.json
+    runtime_map.json
+  logs/
+  sync/
+```
+
+## Source layout
+
+```text
+src/core/      configuration loading and JSON utilities
+src/io/        CSV/JSON output helpers and DHALSIM-style CSV conversion
+src/comm/      Modbus endpoint wrapper
+src/sync/      filesystem marker synchronization
+src/plc/       PLC adapter daemon and one-shot commands
+src/scada/     SCADA poll/downlink daemon and one-shot commands
+src/physics/   DHALSIM-epynet physical engine
+src/runtime/   closed-loop coordinator entry points
+src/check/     manual post-run actuator/open-loop checks and plots
+src/control/   ST generation, ST validation, PLC compilation and PLC launch
+src/network/   network.sh and ns3_network.cc generation
+src/run/       one-click orchestration helpers
+```

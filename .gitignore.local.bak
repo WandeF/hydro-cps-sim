@@ -1,0 +1,45 @@
+cat >> .gitignore <<'EOF'
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# virtual environments
+.venv/
+venv/
+env/
+*.egg-info/
+
+# local config / secrets
+.env
+.env.*
+!.env.example
+
+# runtime outputs
+examples/*/output/
+output/
+runtime/
+logs/
+*.log
+*.pcap
+*.pcapng
+
+# generated / compiled files
+build/
+dist/
+*.o
+*.so
+*.a
+*.out
+*.exe
+
+# large simulation artifacts
+*.csv
+*.xlsx
+
+# IDE
+.vscode/
+.idea/
+EOF

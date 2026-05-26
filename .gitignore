@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Runtime/generated outputs
+examples/*/output/
+output/
+runtime/
+logs/
+*.log
+*.pid
+
+# Large/generated binaries
+*.so
+*.o
+*.a
+*.bin
+*.exe
+
+# OpenPLC generated/runtime files
+examples/*/output/plcs/
+examples/*/output/runtime/
+
+# ns-3 build/cache
+build/
+cmake-cache/
+CMakeFiles/
+CMakeCache.txt
+
+# Editor/system
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Temporary files
+tmp/
+temp/
+*.tmp

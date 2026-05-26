@@ -1,0 +1,639 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+SCADA Modbus client.
+
+One-shot poll/downlink commands are retained for compatibility. Daemon mode runs
+as a long-lived SCADA scheduler inside ns-scada and is synchronized by shared
+filesystem markers.
+"""
+from __future__ import annotations
+
+import argparse
+import signal
+import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any, Callable
+
+from src.io.csv import append_row, csv_dir, json_dir
+from src.comm.modbus import ModbusEndpoint
+from src.core.config import MdVar, RuntimeConfig, load_runtime_config, read_json, write_json
+from src.sync.filesystem import DEFAULT_POLL_INTERVAL, marker_path, stop_requested, touch_marker, wait_for_markers
+from src.sync.helics_sync import HelicsSync, coordinator_endpoint, scada_endpoint
+
+_STOP = False
+
+
+def _install_signal_handlers() -> None:
+    def _handler(signum, frame):  # type: ignore[no-untyped-def]
+        global _STOP
+        _STOP = True
+
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT, _handler)
+
+
+def _source_candidates(var: MdVar, poll: dict[str, Any], physics_values: dict[str, Any]) -> list[tuple[str, Any]]:
+    candidates: list[tuple[str, Any]] = []
+    if var.source_prefix:
+        src_plc = var.source_prefix.upper()
+        # Source PLC may have already been polled under the same full variable name.
+        try:
+            source_plc_data = poll.get("plcs", {}).get(src_plc, {}).get("md", {})
+            if var.name in source_plc_data:
+                candidates.append((f"poll:{src_plc}:{var.name}", source_plc_data[var.name]))
+            source_name = f"{src_plc}_{var.tag}"
+            if source_name in source_plc_data:
+                candidates.append((f"poll:{src_plc}:{source_name}", source_plc_data[source_name]))
+        except Exception:
+            pass
+
+    for key in (var.name, var.tag):
+        if key in physics_values:
+            candidates.append((f"physics:{key}", physics_values[key]))
+
+    return candidates
+
+
+def _modbus_workers(args: argparse.Namespace, plc_count: int) -> int:
+    workers = int(getattr(args, "modbus_workers", 1) or 1)
+    return max(1, min(workers, max(1, plc_count)))
+
+
+def _batch_modbus_enabled(args: argparse.Namespace) -> bool:
+    return not bool(getattr(args, "no_batch_modbus", False))
+
+
+def _run_plc_tasks(
+    plcs: list[Any],
+    args: argparse.Namespace,
+    worker: Callable[[Any], tuple[str, dict[str, Any], dict[str, Any]]],
+) -> list[tuple[str, dict[str, Any], dict[str, Any]]]:
+    if len(plcs) <= 1 or _modbus_workers(args, len(plcs)) <= 1:
+        return [worker(plc) for plc in plcs]
+    with ThreadPoolExecutor(max_workers=_modbus_workers(args, len(plcs))) as executor:
+        # executor.map preserves input order, which keeps CSV/log order stable.
+        return list(executor.map(worker, plcs))
+
+
+def _get_or_open_endpoint(plc: Any, args: argparse.Namespace, endpoints: dict[str, ModbusEndpoint] | None) -> tuple[ModbusEndpoint, bool]:
+    if endpoints is not None and plc.name in endpoints:
+        return endpoints[plc.name], False
+    mb = ModbusEndpoint(plc.ip, port=args.port, unit_id=args.unit_id, timeout=args.timeout)
+    mb.connect()
+    return mb, True
+
+
+def _poll_one_plc(
+    plc: Any,
+    args: argparse.Namespace,
+    endpoints: dict[str, ModbusEndpoint] | None = None,
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    item: dict[str, Any] = {"ip": plc.ip, "md": {}, "coils": {}, "errors": []}
+    flat: dict[str, Any] = {}
+    if not plc.ip:
+        item["errors"].append("no IP in config")
+        return plc.name, item, flat
+
+    mb: ModbusEndpoint | None = None
+    close_after = False
+    try:
+        mb, close_after = _get_or_open_endpoint(plc, args, endpoints)
+        md_vars = [var for var in plc.md_vars.values() if not (args.skip_ready and var.name == "PLC_Ready")]
+        if md_vars:
+            if _batch_modbus_enabled(args):
+                try:
+                    md_values = mb.read_real_mds(var.md_index for var in md_vars)
+                    for var in md_vars:
+                        value = md_values[var.md_index]
+                        item["md"][var.name] = value
+                        flat[var.name] = value
+                except Exception as exc:
+                    item["errors"].append(f"batch read md: {exc}; fallback to single reads")
+                    for var in md_vars:
+                        try:
+                            value = mb.read_real_md(var.md_index)
+                            item["md"][var.name] = value
+                            flat[var.name] = value
+                        except Exception as var_exc:
+                            item["errors"].append(f"read {var.name} %MD{var.md_index}: {var_exc}")
+            else:
+                for var in md_vars:
+                    try:
+                        value = mb.read_real_md(var.md_index)
+                        item["md"][var.name] = value
+                        flat[var.name] = value
+                    except Exception as exc:
+                        item["errors"].append(f"read {var.name} %MD{var.md_index}: {exc}")
+
+        if args.read_coils and plc.coil_vars:
+            if _batch_modbus_enabled(args):
+                try:
+                    coil_values = mb.read_coils(var.coil_index for var in plc.coil_vars.values())
+                    for var in plc.coil_vars.values():
+                        value = coil_values[var.coil_index]
+                        item["coils"][var.name] = value
+                        flat[var.name] = value
+                except Exception as exc:
+                    item["errors"].append(f"batch read coils: {exc}; fallback to single reads")
+                    for var in plc.coil_vars.values():
+                        try:
+                            value = mb.read_coil(var.coil_index)
+                            item["coils"][var.name] = value
+                            flat[var.name] = value
+                        except Exception as var_exc:
+                            item["errors"].append(f"read {var.name} coil{var.coil_index}: {var_exc}")
+            else:
+                for var in plc.coil_vars.values():
+                    try:
+                        value = mb.read_coil(var.coil_index)
+                        item["coils"][var.name] = value
+                        flat[var.name] = value
+                    except Exception as exc:
+                        item["errors"].append(f"read {var.name} coil{var.coil_index}: {exc}")
+    except Exception as exc:
+        item["errors"].append(f"connect/read {plc.ip}:{args.port}: {exc}")
+    finally:
+        if close_after and mb is not None:
+            mb.close()
+
+    return plc.name, item, flat
+
+
+def _poll_runtime(
+    rt: RuntimeConfig,
+    args: argparse.Namespace,
+    endpoints: dict[str, ModbusEndpoint] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"plcs": {}, "flat": {}}
+    plcs = [plc for plc in rt.plcs.values() if plc.ip]
+    missing = [plc for plc in rt.plcs.values() if not plc.ip]
+    for plc in missing:
+        print(f"[SCADA] skip {plc.name}: no IP in config", flush=True)
+
+    results = _run_plc_tasks(plcs, args, lambda plc: _poll_one_plc(plc, args, endpoints))
+    for plc_name, item, flat in results:
+        payload["plcs"][plc_name] = item
+        payload["flat"].update(flat)
+        print(f"[SCADA] poll {plc_name:5s} ip={item.get('ip', ''):15s} md={len(item['md'])} coils={len(item['coils'])} errors={len(item['errors'])}", flush=True)
+        for err in item["errors"]:
+            print(f"  [ERR] {err}", flush=True)
+
+    return payload
+
+def poll(args: argparse.Namespace) -> int:
+    rt = load_runtime_config(args.config)
+    payload = _poll_runtime(rt, args)
+    write_json(args.out, payload)
+    return 0
+
+
+def _prepare_downlink_writes(
+    plc: Any,
+    poll_payload: dict[str, Any],
+    physics_values: dict[str, Any],
+) -> tuple[dict[str, Any], list[tuple[MdVar, float, str]]]:
+    item: dict[str, Any] = {"ip": plc.ip, "written": {}, "skipped": {}, "errors": []}
+    writes: list[tuple[MdVar, float, str]] = []
+
+    for var in plc.md_vars.values():
+        if var.name == "PLC_Ready":
+            continue
+        # Only downlink dependency variables. Local variables are written by the local adapter.
+        if var.source_prefix in {None, plc.name}:
+            continue
+
+        candidates = _source_candidates(var, poll_payload, physics_values)
+        if not candidates:
+            item["skipped"][var.name] = f"no source for {var.name}/{var.tag}"
+            continue
+        source, raw = candidates[0]
+        try:
+            writes.append((var, float(raw), source))
+        except Exception as exc:
+            item["skipped"][var.name] = f"bad value from {source}: {raw!r}: {exc}"
+
+    return item, writes
+
+
+def _downlink_one_plc(
+    plc: Any,
+    args: argparse.Namespace,
+    item: dict[str, Any],
+    writes: list[tuple[MdVar, float, str]],
+    endpoints: dict[str, ModbusEndpoint] | None = None,
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    flat: dict[str, Any] = {}
+    if not writes:
+        return plc.name, item, flat
+
+    mb: ModbusEndpoint | None = None
+    close_after = False
+    try:
+        mb, close_after = _get_or_open_endpoint(plc, args, endpoints)
+        if _batch_modbus_enabled(args):
+            try:
+                mb.write_real_mds({var.md_index: value for var, value, _source in writes})
+                for var, value, source in writes:
+                    item["written"][var.name] = {"value": value, "source": source, "md_index": var.md_index}
+                    flat[var.name] = value
+            except Exception as exc:
+                item["errors"].append(f"batch write md: {exc}; fallback to single writes")
+                for var, value, source in writes:
+                    try:
+                        mb.write_real_md(var.md_index, value)
+                        item["written"][var.name] = {"value": value, "source": source, "md_index": var.md_index}
+                        flat[var.name] = value
+                    except Exception as var_exc:
+                        item["errors"].append(f"write {var.name} %MD{var.md_index}: {var_exc}")
+        else:
+            for var, value, source in writes:
+                try:
+                    mb.write_real_md(var.md_index, value)
+                    item["written"][var.name] = {"value": value, "source": source, "md_index": var.md_index}
+                    flat[var.name] = value
+                except Exception as exc:
+                    item["errors"].append(f"write {var.name} %MD{var.md_index}: {exc}")
+    except Exception as exc:
+        item["errors"].append(f"connect/write {plc.ip}:{args.port}: {exc}")
+    finally:
+        if close_after and mb is not None:
+            mb.close()
+
+    return plc.name, item, flat
+
+
+def _downlink_runtime(
+    rt: RuntimeConfig,
+    args: argparse.Namespace,
+    poll_payload: dict[str, Any],
+    physics_values: dict[str, Any],
+    endpoints: dict[str, ModbusEndpoint] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"plcs": {}, "flat": {}}
+    tasks: list[tuple[Any, dict[str, Any], list[tuple[MdVar, float, str]]]] = []
+
+    for plc in rt.plcs.values():
+        if not plc.ip:
+            continue
+        item, writes = _prepare_downlink_writes(plc, poll_payload, physics_values)
+        tasks.append((plc, item, writes))
+
+    if len(tasks) <= 1 or _modbus_workers(args, len(tasks)) <= 1:
+        results = [_downlink_one_plc(plc, args, item, writes, endpoints) for plc, item, writes in tasks]
+    else:
+        with ThreadPoolExecutor(max_workers=_modbus_workers(args, len(tasks))) as executor:
+            results = list(executor.map(lambda t: _downlink_one_plc(t[0], args, t[1], t[2], endpoints), tasks))
+
+    for plc_name, item, flat in results:
+        payload["plcs"][plc_name] = item
+        payload["flat"].update(flat)
+        print(f"[SCADA] downlink {plc_name:5s} ip={item.get('ip', ''):15s} written={len(item['written'])} skipped={len(item['skipped'])} errors={len(item['errors'])}", flush=True)
+        for name, meta in item["written"].items():
+            print(f"  WRITE {name:16s} %MD{meta['md_index']:<3d} = {meta['value']} from {meta['source']}", flush=True)
+        for err in item["errors"]:
+            print(f"  [ERR] {err}", flush=True)
+
+    return payload
+
+def _write_scada_csv(runtime_dir: Path, iteration: int, poll_payload: dict[str, Any], downlink_payload: dict[str, Any]) -> None:
+    row: dict[str, Any] = {"iteration": iteration}
+
+    total_poll_md = 0
+    total_poll_coils = 0
+    total_poll_errors = 0
+    total_downlink_written = 0
+    total_downlink_skipped = 0
+    total_downlink_errors = 0
+
+    for plc_name, item in sorted((poll_payload.get("plcs", {}) or {}).items()):
+        prefix = f"poll.{plc_name}"
+        md = item.get("md", {}) or {}
+        coils = item.get("coils", {}) or {}
+        errors = item.get("errors", []) or []
+        row[f"{prefix}.ip"] = item.get("ip", "")
+        row[f"{prefix}.md_count"] = len(md)
+        row[f"{prefix}.coil_count"] = len(coils)
+        row[f"{prefix}.error_count"] = len(errors)
+        if errors:
+            row[f"{prefix}.errors"] = " | ".join(str(e) for e in errors)
+        for name, value in md.items():
+            row[f"{prefix}.md.{name}"] = value
+        for name, value in coils.items():
+            row[f"{prefix}.coil.{name}"] = value
+        total_poll_md += len(md)
+        total_poll_coils += len(coils)
+        total_poll_errors += len(errors)
+
+    for plc_name, item in sorted((downlink_payload.get("plcs", {}) or {}).items()):
+        prefix = f"downlink.{plc_name}"
+        written = item.get("written", {}) or {}
+        skipped = item.get("skipped", {}) or {}
+        errors = item.get("errors", []) or []
+        row[f"{prefix}.ip"] = item.get("ip", "")
+        row[f"{prefix}.written_count"] = len(written)
+        row[f"{prefix}.skipped_count"] = len(skipped)
+        row[f"{prefix}.error_count"] = len(errors)
+        if errors:
+            row[f"{prefix}.errors"] = " | ".join(str(e) for e in errors)
+        for name, meta in written.items():
+            row[f"{prefix}.write.{name}.value"] = meta.get("value")
+            row[f"{prefix}.write.{name}.source"] = meta.get("source")
+            row[f"{prefix}.write.{name}.md_index"] = meta.get("md_index")
+        total_downlink_written += len(written)
+        total_downlink_skipped += len(skipped)
+        total_downlink_errors += len(errors)
+
+    row.update({
+        "poll_md_total": total_poll_md,
+        "poll_coil_total": total_poll_coils,
+        "poll_error_total": total_poll_errors,
+        "downlink_written_total": total_downlink_written,
+        "downlink_skipped_total": total_downlink_skipped,
+        "downlink_error_total": total_downlink_errors,
+    })
+
+    append_row(
+        csv_dir(runtime_dir) / "scada.csv",
+        row,
+        fixed_columns=[
+            "iteration",
+            "poll_md_total",
+            "poll_coil_total",
+            "poll_error_total",
+            "downlink_written_total",
+            "downlink_skipped_total",
+            "downlink_error_total",
+        ],
+    )
+
+
+def _write_scada_timing_csv(runtime_dir: Path, timing: dict[str, Any]) -> None:
+    append_row(
+        csv_dir(runtime_dir) / "scada_timing.csv",
+        timing,
+        fixed_columns=[
+            "iteration",
+            "wait_local_write_markers_sec",
+            "poll_sec",
+            "read_physics_json_sec",
+            "downlink_sec",
+            "write_scada_csv_sec",
+            "write_outputs_and_marker_sec",
+            "cycle_total_sec",
+            "poll_md_total",
+            "poll_coil_total",
+            "poll_error_total",
+            "downlink_written_total",
+            "downlink_skipped_total",
+            "downlink_error_total",
+        ],
+    )
+
+
+def _count_scada_payloads(poll_payload: dict[str, Any], downlink_payload: dict[str, Any]) -> dict[str, int]:
+    poll_md_total = 0
+    poll_coil_total = 0
+    poll_error_total = 0
+    for item in (poll_payload.get("plcs", {}) or {}).values():
+        poll_md_total += len(item.get("md", {}) or {})
+        poll_coil_total += len(item.get("coils", {}) or {})
+        poll_error_total += len(item.get("errors", []) or [])
+
+    downlink_written_total = 0
+    downlink_skipped_total = 0
+    downlink_error_total = 0
+    for item in (downlink_payload.get("plcs", {}) or {}).values():
+        downlink_written_total += len(item.get("written", {}) or {})
+        downlink_skipped_total += len(item.get("skipped", {}) or {})
+        downlink_error_total += len(item.get("errors", []) or [])
+
+    return {
+        "poll_md_total": poll_md_total,
+        "poll_coil_total": poll_coil_total,
+        "poll_error_total": poll_error_total,
+        "downlink_written_total": downlink_written_total,
+        "downlink_skipped_total": downlink_skipped_total,
+        "downlink_error_total": downlink_error_total,
+    }
+
+
+def downlink(args: argparse.Namespace) -> int:
+    rt = load_runtime_config(args.config)
+    poll_payload = read_json(args.poll) if args.poll else {"plcs": {}, "flat": {}}
+    physics = read_json(args.physics)
+    physics_values = physics.get("values", physics)
+    if not isinstance(physics_values, dict):
+        raise ValueError("physics JSON must contain object or {'values': object}")
+
+    payload = _downlink_runtime(rt, args, poll_payload, physics_values)
+    write_json(args.out, payload)
+    return 0
+
+
+def _connect_scada_endpoints(rt: RuntimeConfig, args: argparse.Namespace) -> dict[str, ModbusEndpoint]:
+    endpoints: dict[str, ModbusEndpoint] = {}
+    for plc in rt.plcs.values():
+        if not plc.ip:
+            continue
+        mb = ModbusEndpoint(plc.ip, port=args.port, unit_id=args.unit_id, timeout=args.timeout)
+        mb.connect(
+            retries=max(1, int(getattr(args, "connect_retries", 1) or 1)),
+            delay=float(getattr(args, "connect_retry_delay", 0.2) or 0.2),
+        )
+        endpoints[plc.name] = mb
+    return endpoints
+
+
+def _close_scada_endpoints(endpoints: dict[str, ModbusEndpoint] | None) -> None:
+    if not endpoints:
+        return
+    for mb in endpoints.values():
+        mb.close()
+
+
+def daemon(args: argparse.Namespace) -> int:
+    _install_signal_handlers()
+    rt = load_runtime_config(args.config)
+    runtime_dir = args.runtime_dir or (rt.output_dir / "runtime")
+    sync_dir = args.sync_dir or (runtime_dir / "sync")
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    out_json_dir = json_dir(runtime_dir)
+    sync_dir.mkdir(parents=True, exist_ok=True)
+
+    expected_local_markers = [plc.lower_name for plc in rt.plcs.values()]
+    max_iterations = args.max_iterations
+    end_iteration = None if max_iterations is None else args.start_iteration + max_iterations
+
+    print(f"[SCADA-DAEMON] start runtime={runtime_dir} sync={sync_dir} plcs={expected_local_markers}", flush=True)
+
+    sync: HelicsSync | None = None
+    if args.sync_backend == "helics":
+        sync = HelicsSync.from_args(
+            "hydro_scada",
+            scada_endpoint(args.helics_prefix),
+            args,
+            timeout=args.sync_timeout,
+        ).start()
+        print(f"[SCADA-DAEMON] HELICS endpoint={sync.endpoint}", flush=True)
+
+    endpoints: dict[str, ModbusEndpoint] | None = None
+    if not args.no_persistent_scada_connections:
+        endpoints = _connect_scada_endpoints(rt, args)
+        print(f"[SCADA-DAEMON] persistent Modbus connections={len(endpoints)}", flush=True)
+
+    iteration = args.start_iteration
+    try:
+        while not _STOP and not stop_requested(sync_dir):
+            if end_iteration is not None and iteration >= end_iteration:
+                break
+            try:
+                cycle_t0 = time.monotonic()
+                timing: dict[str, Any] = {"iteration": iteration}
+
+                wait_t0 = time.monotonic()
+                if args.sync_backend == "helics":
+                    if sync is None:
+                        raise RuntimeError("HELICS SCADA sync is not initialized")
+                    sync.wait_for("local_write", iteration=iteration, count=len(expected_local_markers), timeout=args.sync_timeout)
+                else:
+                    wait_for_markers(
+                        [marker_path(sync_dir, "local_write", iteration, plc) for plc in expected_local_markers],
+                        timeout=args.sync_timeout,
+                        poll_interval=args.poll_interval,
+                        stop_dir=sync_dir,
+                    )
+                timing["wait_local_write_markers_sec"] = time.monotonic() - wait_t0
+
+                poll_path = out_json_dir / f"scada_poll_{iteration:04d}.json"
+                poll_t0 = time.monotonic()
+                poll_payload = _poll_runtime(rt, args, endpoints=endpoints)
+                write_json(poll_path, poll_payload)
+                timing["poll_sec"] = time.monotonic() - poll_t0
+
+                read_physics_t0 = time.monotonic()
+                physics_path = out_json_dir / f"physics_{iteration:04d}.json"
+                physics = read_json(physics_path)
+                physics_values = physics.get("values", physics)
+                if not isinstance(physics_values, dict):
+                    raise ValueError("physics JSON must contain object or {'values': object}")
+                timing["read_physics_json_sec"] = time.monotonic() - read_physics_t0
+
+                downlink_path = out_json_dir / f"scada_downlink_{iteration:04d}.json"
+                downlink_t0 = time.monotonic()
+                downlink_payload = _downlink_runtime(rt, args, poll_payload, physics_values, endpoints=endpoints)
+                write_json(downlink_path, downlink_payload)
+                timing["downlink_sec"] = time.monotonic() - downlink_t0
+
+                csv_t0 = time.monotonic()
+                _write_scada_csv(runtime_dir, iteration, poll_payload, downlink_payload)
+                timing["write_scada_csv_sec"] = time.monotonic() - csv_t0
+
+                marker_t0 = time.monotonic()
+                scada_signal = {
+                    "iteration": iteration,
+                    "poll": str(poll_path),
+                    "downlink": str(downlink_path),
+                }
+                if args.sync_backend == "helics":
+                    if sync is None:
+                        raise RuntimeError("HELICS SCADA sync is not initialized")
+                    sync.send(coordinator_endpoint(sync.prefix), "scada_downlink", iteration, scada_signal)
+                    sync.flush_time()
+                else:
+                    touch_marker(marker_path(sync_dir, "scada_downlink", iteration), scada_signal)
+                timing.update(_count_scada_payloads(poll_payload, downlink_payload))
+                timing["write_outputs_and_marker_sec"] = time.monotonic() - marker_t0
+                timing["cycle_total_sec"] = time.monotonic() - cycle_t0
+                _write_scada_timing_csv(runtime_dir, timing)
+                print(
+                    f"[SCADA-DAEMON] cycle={iteration} done "
+                    f"timing wait={timing['wait_local_write_markers_sec']:.4f}s "
+                    f"poll={timing['poll_sec']:.4f}s "
+                    f"downlink={timing['downlink_sec']:.4f}s "
+                    f"csv={timing['write_scada_csv_sec']:.4f}s "
+                    f"total={timing['cycle_total_sec']:.4f}s",
+                    flush=True,
+                )
+                iteration += 1
+            except Exception as exc:
+                err_path = out_json_dir / f"error_{iteration:04d}_scada.json"
+                write_json(err_path, {"iteration": iteration, "error": str(exc), "traceback": traceback.format_exc()})
+                error_signal = {"iteration": iteration, "error": str(exc), "output": str(err_path)}
+                if args.sync_backend == "helics" and sync is not None:
+                    try:
+                        sync.send(coordinator_endpoint(sync.prefix), "error", iteration, error_signal)
+                        sync.flush_time()
+                    except Exception:
+                        pass
+                else:
+                    touch_marker(marker_path(sync_dir, "error", iteration, "scada"), error_signal)
+                print(f"[SCADA-DAEMON][ERR] cycle={iteration}: {exc}", flush=True)
+                if args.keep_running_on_error:
+                    iteration += 1
+                    continue
+                return 1
+    finally:
+        _close_scada_endpoints(endpoints)
+        if sync is not None:
+            sync.close()
+
+    print(f"[SCADA-DAEMON] stop last_iteration={iteration}", flush=True)
+    return 0
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="SCADA poll/downlink client for Hydro-CPS-Sim")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--config", required=True, type=Path)
+    common.add_argument("--port", type=int, default=502)
+    common.add_argument("--unit-id", type=int, default=1)
+    common.add_argument("--timeout", type=float, default=2.0)
+    common.add_argument("--skip-ready", action="store_true", default=True)
+    common.add_argument("--read-coils", action="store_true")
+    common.add_argument("--modbus-workers", type=int, default=8, help="Concurrent PLC Modbus workers for SCADA poll/downlink")
+    common.add_argument("--no-batch-modbus", action="store_true", help="Disable batched Modbus reads/writes and use per-variable requests")
+
+    p_poll = sub.add_parser("poll", parents=[common])
+    p_poll.add_argument("--out", required=True, type=Path)
+    p_poll.set_defaults(func=poll)
+
+    p_down = sub.add_parser("downlink", parents=[common])
+    p_down.add_argument("--physics", required=True, type=Path)
+    p_down.add_argument("--poll", type=Path)
+    p_down.add_argument("--out", required=True, type=Path)
+    p_down.set_defaults(func=downlink)
+
+    p_daemon = sub.add_parser("daemon", parents=[common])
+    p_daemon.add_argument("--sync-dir", type=Path)
+    p_daemon.add_argument("--runtime-dir", type=Path)
+    p_daemon.add_argument("--start-iteration", type=int, default=0)
+    p_daemon.add_argument("--max-iterations", type=int)
+    p_daemon.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL, help="Filesystem marker polling interval in seconds")
+    p_daemon.add_argument("--sync-timeout", type=float, default=30.0)
+    p_daemon.add_argument("--sync-backend", choices=["filesystem", "helics"], default="filesystem")
+    p_daemon.add_argument("--helics-core-type", default="ipc")
+    p_daemon.add_argument("--helics-core-init", default="")
+    p_daemon.add_argument("--helics-broker-address", default="")
+    p_daemon.add_argument("--helics-time-delta", type=float, default=0.001)
+    p_daemon.add_argument("--helics-prefix", default="hydro")
+    p_daemon.add_argument("--helics-log-level", type=int, default=1)
+    p_daemon.add_argument("--connect-retries", type=int, default=10)
+    p_daemon.add_argument("--connect-retry-delay", type=float, default=0.2)
+    p_daemon.add_argument("--no-persistent-scada-connections", action="store_true", help="Reconnect for each SCADA poll/downlink instead of reusing Modbus connections")
+    p_daemon.add_argument("--keep-running-on-error", action="store_true")
+    p_daemon.set_defaults(func=daemon)
+
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

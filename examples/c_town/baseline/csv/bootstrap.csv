@@ -1,0 +1,2 @@
+iteration,physics_json,actuator_state_json,plc_count,actuator_count,bootstrap_wait
+1,/home/lzh/MASTER/CODE/hydro-cps-sim/examples/c_town/output/runtime/json/physics_0001.json,/home/lzh/MASTER/CODE/hydro-cps-sim/examples/c_town/output/runtime/json/actuator_state_initial.json,8,11,0.3
