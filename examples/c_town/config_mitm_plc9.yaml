@@ -629,43 +629,43 @@ network:
   taps:
   - endpoint: scada
     tap_name: tap-scada
-    mode: use_local
+    mode: use_bridge
     host_namespace: ns-scada
   - endpoint: PLC1
     tap_name: tap-plc1
-    mode: use_local
+    mode: use_bridge
     host_namespace: ns-plc1
   - endpoint: PLC2
     tap_name: tap-plc2
-    mode: use_local
+    mode: use_bridge
     host_namespace: ns-plc2
   - endpoint: PLC3
     tap_name: tap-plc3
-    mode: use_local
+    mode: use_bridge
     host_namespace: ns-plc3
   - endpoint: PLC4
     tap_name: tap-plc4
-    mode: use_local
+    mode: use_bridge
     host_namespace: ns-plc4
   - endpoint: PLC5
     tap_name: tap-plc5
-    mode: use_local
+    mode: use_bridge
     host_namespace: ns-plc5
   - endpoint: PLC7
     tap_name: tap-plc7
-    mode: use_local
+    mode: use_bridge
     host_namespace: ns-plc7
   - endpoint: PLC8
     tap_name: tap-plc8
-    mode: use_local
+    mode: use_bridge
     host_namespace: ns-plc8
   - endpoint: PLC9
     tap_name: tap-plc9
-    mode: use_local
+    mode: use_bridge
     host_namespace: ns-plc9
   - endpoint: mitm
     tap_name: tap-attacker
-    mode: use_local
+    mode: use_bridge
     host_namespace: ns-attacker
   applications:
   - name: scada_to_plc1

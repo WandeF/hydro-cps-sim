@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
-from src.io.csv import append_row, csv_dir, json_dir
+from src.io.csv import append_jsonl, append_row, csv_dir, json_dir, raw_dir
 from src.comm.modbus import ModbusEndpoint
 from src.core.config import MdVar, RuntimeConfig, load_runtime_config, read_json, write_json
 from src.sync.filesystem import DEFAULT_POLL_INTERVAL, marker_path, stop_requested, touch_marker, wait_for_markers
@@ -370,6 +370,64 @@ def _write_scada_csv(runtime_dir: Path, iteration: int, poll_payload: dict[str, 
     )
 
 
+def _write_scada_observed_csv(runtime_dir: Path, iteration: int, poll_payload: dict[str, Any]) -> None:
+    """Append SCADA-observed Modbus poll values in long form.
+
+    These values are the decoded values returned to SCADA by Modbus polling.
+    Under MITM experiments this is the post-MITM value seen by SCADA, not the
+    physical state from physics_XXXX.json.
+    """
+    observed_at = f"{time.time():.6f}"
+    path = csv_dir(runtime_dir) / "scada_observed.csv"
+    raw_path = raw_dir(runtime_dir) / "scada_observed.jsonl"
+    fixed_columns = [
+        "iteration",
+        "plc",
+        "variable",
+        "value",
+        "source",
+        "direction",
+        "timestamp_epoch",
+        "kind",
+    ]
+
+    for plc_name, item in sorted((poll_payload.get("plcs", {}) or {}).items()):
+        for name, value in sorted((item.get("md", {}) or {}).items()):
+            row = {
+                "iteration": iteration,
+                "plc": plc_name,
+                "variable": name,
+                "value": value,
+                "source": "modbus_poll",
+                "direction": "response",
+                "timestamp_epoch": observed_at,
+                "kind": "md",
+            }
+            append_jsonl(raw_path, row)
+            append_row(
+                path,
+                row,
+                fixed_columns=fixed_columns,
+            )
+        for name, value in sorted((item.get("coils", {}) or {}).items()):
+            row = {
+                "iteration": iteration,
+                "plc": plc_name,
+                "variable": name,
+                "value": value,
+                "source": "modbus_poll",
+                "direction": "response",
+                "timestamp_epoch": observed_at,
+                "kind": "coil",
+            }
+            append_jsonl(raw_path, row)
+            append_row(
+                path,
+                row,
+                fixed_columns=fixed_columns,
+            )
+
+
 def _write_scada_timing_csv(runtime_dir: Path, timing: dict[str, Any]) -> None:
     append_row(
         csv_dir(runtime_dir) / "scada_timing.csv",
@@ -511,6 +569,7 @@ def daemon(args: argparse.Namespace) -> int:
                 poll_t0 = time.monotonic()
                 poll_payload = _poll_runtime(rt, args, endpoints=endpoints)
                 write_json(poll_path, poll_payload)
+                _write_scada_observed_csv(runtime_dir, iteration, poll_payload)
                 timing["poll_sec"] = time.monotonic() - poll_t0
 
                 read_physics_t0 = time.monotonic()

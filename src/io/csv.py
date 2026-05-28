@@ -16,6 +16,7 @@ Performance note:
 from __future__ import annotations
 
 import csv
+import json
 import math
 from pathlib import Path
 from typing import Any
@@ -33,10 +34,32 @@ def json_dir(runtime_dir: Path) -> Path:
     return path
 
 
+def raw_dir(runtime_dir: Path) -> Path:
+    path = runtime_dir / "raw"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def check_dir(output_dir: Path) -> Path:
     path = output_dir / "check"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def append_jsonl(path: Path, row: dict[str, Any]) -> None:
+    """Append one structured runtime record as JSON Lines."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=_json_default))
+        f.write("\n")
 
 
 def _to_cell(value: Any) -> str | int | float | bool | None:

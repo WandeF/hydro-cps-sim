@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from src.core.config import load_runtime_config, load_yaml
+from src.io.csv import append_jsonl, raw_dir
 
 BASE_MD_REGISTER = 2048
 
@@ -99,6 +100,7 @@ class ConnectionState:
 class EventWriter:
     def __init__(self, path: Path):
         self.path = path
+        self.raw_path = raw_dir(path.parent.parent) / "attack_events.jsonl"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
         self.columns = [
@@ -127,6 +129,23 @@ class EventWriter:
             with self.path.open("a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=self.columns, extrasaction="ignore")
                 writer.writerow(row)
+            append_jsonl(self.raw_path, {
+                "timestamp_epoch": row.get("timestamp_epoch"),
+                "iteration": row.get("iteration"),
+                "scenario": row.get("attack"),
+                "rule": row.get("rule"),
+                "target": row.get("target"),
+                "variable": row.get("variable"),
+                "direction": row.get("direction"),
+                "function_code": row.get("function_code"),
+                "transaction_id": row.get("transaction_id"),
+                "old_value": row.get("original_value"),
+                "new_value": row.get("modified_value"),
+                "md_index": row.get("md_index"),
+                "register": row.get("register"),
+                "client": row.get("client"),
+                "server": row.get("server"),
+            })
 
 
 class AttackStateReader:

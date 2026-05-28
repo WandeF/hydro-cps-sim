@@ -16,7 +16,7 @@ env/
 # Runtime/generated outputs
 examples/*/output/
 output/
-runtime/
+/runtime/
 logs/
 *.log
 *.pid

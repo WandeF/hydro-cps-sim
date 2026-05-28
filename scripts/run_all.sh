@@ -6,6 +6,7 @@ PYTHON_BIN="${PYTHON_BIN:-$(command -v python3)}"
 CONFIG="$PROJECT_ROOT/examples/c_town/config.yaml"
 ITERATIONS="${ITERATIONS:-}"
 RUN_CHECK=0
+RUN_COMPARE="${RUN_COMPARE:-0}"
 SKIP_PREP=0
 SKIP_COMPILE=0
 SKIP_NS3=0
@@ -29,6 +30,10 @@ NS3_PID=""
 SUDO_KEEPALIVE_PID=""
 STOP_PLC_ON_EXIT="${STOP_PLC_ON_EXIT:-1}"
 STOP_ATTACKS_ON_EXIT="${STOP_ATTACKS_ON_EXIT:-1}"
+PRE_CLEAN_STALE_RUNTIME="${PRE_CLEAN_STALE_RUNTIME:-1}"
+CLEAN_STALE_NETWORK_ON_EXIT="${CLEAN_STALE_NETWORK_ON_EXIT:-1}"
+EXPORT_RESULTS_ON_EXIT="${EXPORT_RESULTS_ON_EXIT:-1}"
+EXPORT_RESULTS_DONE=0
 
 usage() {
   cat <<EOF
@@ -39,6 +44,7 @@ Options:
   --config PATH       Config file. Default: examples/c_town/config.yaml
   --iterations N      Override config iterations for this run
   --check             Run scripts/check.sh after closed-loop finishes
+  --compare           Compare this run against examples/<case>/baseline after exporting reports
   --skip-prep         Skip ST/network/ns-3 source generation
   --skip-compile      Skip OpenPLC ST compilation
   --skip-ns3          Do not start ns-3; useful for local debugging only
@@ -71,9 +77,13 @@ Environment:
   HELICS_BROKER_NAME  Broker name when run_all auto-starts helics_broker. Default: hydro_cps_broker
   HELICS_START_BROKER 1 to auto-start helics_broker for --sync-backend helics. Default: 1
   SCADA_MODBUS_WORKERS Concurrent PLC Modbus workers for SCADA. Default: 8
+  RUN_COMPARE         1 to compare run outputs against baseline. Default: 0
   CLEAN_RUNTIME       1 to delete output/runtime and output/check before run. Default: 1
   STOP_PLC_ON_EXIT    1 to stop PLC runtimes when run_all exits. Default: 1
   STOP_ATTACKS_ON_EXIT 1 to stop configured attack proxies/rules when run_all exits. Default: 1
+  PRE_CLEAN_STALE_RUNTIME 1 to clean stale namespaces/processes before run. Default: 1
+  CLEAN_STALE_NETWORK_ON_EXIT 1 to clean namespaces/TAP/bridge/veth on exit. Default: 1
+  EXPORT_RESULTS_ON_EXIT 1 to export reports/csv from runtime/raw/json on exit. Default: 1
 EOF
 }
 
@@ -85,6 +95,8 @@ while [[ $# -gt 0 ]]; do
       ITERATIONS="$2"; shift 2 ;;
     --check)
       RUN_CHECK=1; shift ;;
+    --compare)
+      RUN_COMPARE=1; shift ;;
     --skip-prep)
       SKIP_PREP=1; shift ;;
     --skip-compile)
@@ -150,6 +162,155 @@ stop_plc_runtimes() {
   fi
 }
 
+sudo_maybe() {
+  if sudo -n true 2>/dev/null; then
+    sudo -n "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+list_project_netns() {
+  sudo_maybe ip netns list 2>/dev/null | awk '{print $1}' | grep -E '^ns-' || true
+}
+
+kill_processes_in_netns() {
+  local ns="$1"
+  local pids=""
+  pids="$(sudo_maybe ip netns pids "$ns" 2>/dev/null || true)"
+  if [[ -n "$pids" ]]; then
+    echo "[CLEANUP] killing processes inside $ns: $(echo "$pids" | tr '\n' ' ')"
+    echo "$pids" | xargs -r sudo kill -TERM 2>/dev/null || true
+    sleep 0.5
+    pids="$(sudo_maybe ip netns pids "$ns" 2>/dev/null || true)"
+    if [[ -n "$pids" ]]; then
+      echo "$pids" | xargs -r sudo kill -KILL 2>/dev/null || true
+    fi
+  fi
+}
+
+flush_iptables_in_netns() {
+  local ns="$1"
+  sudo_maybe ip netns exec "$ns" iptables -t nat -F 2>/dev/null || true
+  sudo_maybe ip netns exec "$ns" iptables -t mangle -F 2>/dev/null || true
+  sudo_maybe ip netns exec "$ns" iptables -F 2>/dev/null || true
+}
+
+delete_project_netns() {
+  local ns
+  while read -r ns; do
+    [[ -z "$ns" ]] && continue
+    echo "[CLEANUP] namespace $ns"
+    flush_iptables_in_netns "$ns" || true
+    kill_processes_in_netns "$ns" || true
+    sudo_maybe ip netns del "$ns" 2>/dev/null || true
+  done < <(list_project_netns)
+}
+
+delete_stale_links() {
+  local dev
+  # Linux interface names are limited, so project-generated names usually start
+  # with br-, tap-, veth-, vr-, or vn-. Delete only these generated devices.
+  while read -r dev; do
+    [[ -z "$dev" ]] && continue
+    case "$dev" in
+      br-*|tap-*|veth-*|vr-*|vn-*)
+        echo "[CLEANUP] link $dev"
+        sudo_maybe ip link set "$dev" down 2>/dev/null || true
+        sudo_maybe ip link del "$dev" 2>/dev/null || true
+        ;;
+    esac
+  done < <(sudo_maybe ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | grep -E '^(br-|tap-|veth-|vr-|vn-)' || true)
+}
+
+kill_stale_python_runtime_processes() {
+  # Long-running daemons from previous failed runs. Match by module name to avoid
+  # killing unrelated Python jobs as much as possible.
+  local patterns=(
+    "src.attack.modbus_mitm"
+    "src.attack.launch"
+    "src.plc.adapter"
+    "src.scada.client"
+    "ns3_network"
+  )
+  local pat
+  for pat in "${patterns[@]}"; do
+    if pgrep -af -- "$pat" >/dev/null 2>&1; then
+      echo "[CLEANUP] stopping stale Python runtime: $pat"
+      sudo_maybe pkill -TERM -f -- "$pat" 2>/dev/null || true
+      sleep 0.3
+      sudo_maybe pkill -KILL -f -- "$pat" 2>/dev/null || true
+    fi
+  done
+}
+
+show_stale_ports() {
+  local hits=""
+  hits="$(sudo_maybe ss -lntp 2>/dev/null | grep -E ':(502|15020|15021|15022|15023|15024)\b' || true)"
+  if [[ -n "$hits" ]]; then
+    echo "[CLEANUP] warning: host still has listeners on relevant ports:"
+    echo "$hits"
+  fi
+
+  local ns ns_hits
+  while read -r ns; do
+    [[ -z "$ns" ]] && continue
+    ns_hits="$(sudo_maybe ip netns exec "$ns" ss -lntp 2>/dev/null | grep -E ':(502|15020|15021|15022|15023|15024)\b' || true)"
+    if [[ -n "$ns_hits" ]]; then
+      echo "[CLEANUP] warning: $ns still has listeners on relevant ports:"
+      echo "$ns_hits"
+    fi
+  done < <(list_project_netns)
+}
+
+deep_cleanup_stale_network_runtime() {
+  echo "[CLEANUP] deep cleanup stale network namespaces, iptables, TAP/bridge/veth, and runtime daemons"
+
+  # Stop attack runtime using its own cleanup first, so it can remove DNAT rules
+  # and state cleanly. Ignore errors because stale namespaces may already be gone.
+  sudo_maybe "$PYTHON_BIN" -m src.attack.launch \
+    --config "$CONFIG" \
+    --action stop \
+    --runtime-dir "$OUTPUT_DIR/runtime" \
+    --python "$PYTHON_BIN" 2>/dev/null || true
+
+  kill_stale_python_runtime_processes || true
+  stop_plc_runtimes || true
+  show_stale_ports || true
+  delete_project_netns || true
+  delete_stale_links || true
+}
+
+export_results() {
+  if [[ "${EXPORT_RESULTS_DONE:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ ! -d "$OUTPUT_DIR/runtime" ]]; then
+    return 0
+  fi
+  echo "[EXPORT] generating reports/csv and compatibility runtime/csv"
+  sudo_maybe "$PYTHON_BIN" "$PROJECT_ROOT/scripts/export_results.py" \
+    --config "$CONFIG" \
+    --runtime-dir "$OUTPUT_DIR/runtime" \
+    --reports-dir "$OUTPUT_DIR/reports"
+  sudo_maybe chown -R "$(id -u):$(id -g)" "$OUTPUT_DIR/reports" 2>/dev/null || true
+  EXPORT_RESULTS_DONE=1
+}
+
+compare_attack_results() {
+  local baseline_dir
+  baseline_dir="$(dirname "$CONFIG")/baseline"
+  if [[ ! -e "$baseline_dir" ]]; then
+    echo "[COMPARE] skip: baseline not found at $baseline_dir"
+    return 0
+  fi
+  "$PYTHON_BIN" "$PROJECT_ROOT/scripts/compare_attack_results.py" \
+    --config "$CONFIG" \
+    --baseline "$baseline_dir" \
+    --attack "$OUTPUT_DIR"
+}
+
+
 cleanup() {
   local rc=$?
   trap - EXIT INT TERM
@@ -159,13 +320,18 @@ cleanup() {
     sleep 1
     kill -KILL -- "-$NS3_PID" 2>/dev/null || sudo -n kill -KILL -- "-$NS3_PID" 2>/dev/null || sudo kill -KILL -- "-$NS3_PID" 2>/dev/null || true
   fi
+  if [[ "${STOP_ATTACKS_ON_EXIT:-1}" == "1" ]]; then
+    echo "[CLEANUP] stopping configured attack runtime"
+    sudo_maybe "$PYTHON_BIN" -m src.attack.launch --config "$CONFIG" --action stop --runtime-dir "$OUTPUT_DIR/runtime" --python "$PYTHON_BIN" 2>/dev/null || true
+  fi
   if [[ "${STOP_PLC_ON_EXIT:-1}" == "1" ]]; then
     stop_plc_runtimes || true
   fi
-  if [[ "${STOP_ATTACKS_ON_EXIT:-1}" == "1" ]]; then
-    echo "[CLEANUP] stopping configured attack runtime"
-    sudo -n "$PYTHON_BIN" -m src.attack.launch --config "$CONFIG" --action stop --runtime-dir "$OUTPUT_DIR/runtime" --python "$PYTHON_BIN" 2>/dev/null || \
-      sudo "$PYTHON_BIN" -m src.attack.launch --config "$CONFIG" --action stop --runtime-dir "$OUTPUT_DIR/runtime" --python "$PYTHON_BIN" 2>/dev/null || true
+  if [[ "${EXPORT_RESULTS_ON_EXIT:-1}" == "1" ]]; then
+    export_results || true
+  fi
+  if [[ "${CLEAN_STALE_NETWORK_ON_EXIT:-1}" == "1" ]]; then
+    deep_cleanup_stale_network_runtime || true
   fi
   if [[ -n "${HELICS_BROKER_PID:-}" ]]; then
     echo "[CLEANUP] stopping HELICS broker $HELICS_BROKER_PID"
@@ -178,6 +344,7 @@ cleanup() {
   fi
   exit "$rc"
 }
+
 trap cleanup EXIT INT TERM
 
 ensure_sudo() {
@@ -391,8 +558,12 @@ timing_init
 
 time_stage "Ensure sudo credentials" ensure_sudo
 
+if [[ "$PRE_CLEAN_STALE_RUNTIME" == "1" ]]; then
+  time_stage "Pre-clean stale namespaces, ports, and runtime daemons" deep_cleanup_stale_network_runtime
+fi
+
 if [[ "$CLEAN_RUNTIME" == "1" ]]; then
-  time_stage "Clean previous runtime/check outputs" bash -c 'sudo rm -rf "$1/runtime" "$1/check"; mkdir -p "$2"' _ "$OUTPUT_DIR" "$LOG_DIR"
+  time_stage "Clean previous runtime/check/reports outputs" bash -c 'sudo rm -rf "$1/runtime" "$1/check" "$1/reports"; mkdir -p "$2"' _ "$OUTPUT_DIR" "$LOG_DIR"
 fi
 
 time_stage "Stop stale OpenPLC runtimes from previous runs" stop_plc_runtimes
@@ -445,6 +616,11 @@ time_stage "Run persistent closed-loop control" sudo "$PYTHON_BIN" -m src.runtim
   --logic-wait 0.3 \
   "${SYNC_EXTRA_ARGS[@]}" \
   "${SCADA_EXTRA_ARGS[@]}"
+
+time_stage "Export runtime raw/json reports" export_results
+if [[ "$RUN_COMPARE" == "1" ]]; then
+  time_stage "Compare attack results against baseline" compare_attack_results
+fi
 
 if [[ "$RUN_CHECK" == "1" ]]; then
   time_stage "Run offline check" bash "$PROJECT_ROOT/scripts/check.sh" "$CONFIG"

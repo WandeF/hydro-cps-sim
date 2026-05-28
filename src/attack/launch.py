@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from src.core.config import load_runtime_config, load_yaml
+from src.io.csv import append_jsonl, raw_dir
 
 
 SUPPORTED_MITM_TYPES = {"mitm", "modbus_mitm"}
@@ -105,6 +106,18 @@ def _write_schedule_event(runtime_dir: Path, row: dict[str, Any]) -> None:
         if not exists:
             writer.writeheader()
         writer.writerow({**{c: "" for c in cols}, **row})
+    action = str(row.get("action", ""))
+    append_jsonl(raw_dir(runtime_dir) / "attack_schedule.jsonl", {
+        "timestamp_epoch": row.get("timestamp_epoch"),
+        "iteration": row.get("iteration"),
+        "scenario": row.get("attack"),
+        "target": row.get("target"),
+        "event": action,
+        "active": action == "attack_on",
+        "active_window": row.get("active_window"),
+        "proxy_pid": row.get("proxy_pid"),
+        "message": row.get("message"),
+    })
 
 
 def _write_control_state(
