@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import stat
 from pathlib import Path
@@ -29,6 +30,17 @@ def _resolve_output_dir(config_path: Path, cfg: dict[str, Any]) -> Path:
 
 def _safe_lower(name: str) -> str:
     return name.strip().lower().replace("_", "-")
+
+
+def _linux_ifname(name: str, *, prefix: str, suffix: str) -> str:
+    """Return a deterministic Linux interface name no longer than 15 chars."""
+    safe = _safe_lower(name)
+    candidate = f"veth-{safe}-{suffix}"
+    if len(candidate) <= 15:
+        return candidate
+    digest = hashlib.sha1(safe.encode("utf-8")).hexdigest()[:4]
+    keep = 15 - len(prefix) - 2 - len(digest)
+    return f"{prefix}-{safe[:keep]}-{digest}"
 
 
 def _endpoint_entries(cfg: dict[str, Any]) -> list[dict[str, str]]:
@@ -87,7 +99,7 @@ def generate_network_sh(cfg: dict[str, Any]) -> str:
     ns_list = [e["namespace"] for e in entries]
     tap_list = [e["tap"] for e in entries]
     br_list = [f"br-{_safe_lower(e['name'])}" for e in entries]
-    veth_roots = [f"veth-{_safe_lower(e['name'])}-root" for e in entries]
+    veth_roots = [_linux_ifname(e["name"], prefix="vr", suffix="root") for e in entries]
 
     lines: list[str] = []
     lines.append("#!/usr/bin/env bash")
@@ -172,9 +184,12 @@ def generate_network_sh(cfg: dict[str, Any]) -> str:
 
     for e in entries:
         lower = _safe_lower(e["name"])
+        br = f"br-{lower}"
+        veth_root = _linux_ifname(e["name"], prefix="vr", suffix="root")
+        veth_ns = _linux_ifname(e["name"], prefix="vn", suffix="ns")
         lines.append(
-            f'create_segment "{lower}" "{e["namespace"]}" "{e["tap"]}" "br-{lower}" \\\n'
-            f'    "veth-{lower}-root" "veth-{lower}-ns" "{e["host_ip"]}" "{e["gateway"]}"'
+            f'create_segment "{lower}" "{e["namespace"]}" "{e["tap"]}" "{br}" \\\n'
+            f'    "{veth_root}" "{veth_ns}" "{e["host_ip"]}" "{e["gateway"]}"'
         )
         lines.append("")
 

@@ -26,6 +26,7 @@ from src.io.csv import append_jsonl, raw_dir
 
 
 SUPPORTED_MITM_TYPES = {"mitm", "modbus_mitm"}
+SUPPORTED_DOS_TYPES = {"udp_dos", "dos_udp", "udp_cbr_flood"}
 
 
 def _scenario_list(cfg: dict[str, Any]) -> list[dict[str, Any]]:
@@ -52,6 +53,13 @@ def _endpoint_namespace(cfg: dict[str, Any], endpoint_name: str) -> str:
     raise ValueError(f"endpoint has no namespace: {endpoint_name}")
 
 
+def _endpoint_entry(cfg: dict[str, Any], endpoint_name: str) -> dict[str, Any]:
+    for ep in cfg.get("network", {}).get("nodes", {}).get("endpoints", []) or []:
+        if isinstance(ep, dict) and str(ep.get("name", "")) == endpoint_name:
+            return ep
+    raise ValueError(f"endpoint not found in network.nodes.endpoints: {endpoint_name}")
+
+
 def _endpoint_ip(cfg: dict[str, Any], endpoint_name: str) -> str:
     for lan in cfg.get("network", {}).get("lans", []) or []:
         if not isinstance(lan, dict):
@@ -63,6 +71,35 @@ def _endpoint_ip(cfg: dict[str, Any], endpoint_name: str) -> str:
         if raw:
             return str(ipaddress.ip_interface(str(raw)).ip)
     raise ValueError(f"endpoint has no LAN IP: {endpoint_name}")
+
+
+def _internal_networks(cfg: dict[str, Any]) -> list[ipaddress._BaseNetwork]:
+    networks: list[ipaddress._BaseNetwork] = [
+        ipaddress.ip_network("192.168.0.0/16"),
+        ipaddress.ip_network("10.0.0.0/8"),
+    ]
+    network_cfg = cfg.get("network", {}) or {}
+    for group in ("lans", "backbone_links"):
+        for item in network_cfg.get(group, []) or []:
+            if not isinstance(item, dict) or not item.get("subnet"):
+                continue
+            try:
+                networks.append(ipaddress.ip_network(str(item["subnet"]), strict=False))
+            except ValueError:
+                pass
+    return networks
+
+
+def _require_internal_ip(cfg: dict[str, Any], ip_raw: str) -> str:
+    try:
+        ip = ipaddress.ip_address(str(ip_raw))
+    except ValueError as exc:
+        raise ValueError(f"invalid DoS target IP: {ip_raw}") from exc
+    if not any(ip in network for network in _internal_networks(cfg)):
+        raise ValueError(f"DoS target {ip} is not an internal simulated endpoint")
+    if ip.is_global:
+        raise ValueError(f"DoS target {ip} is not an internal simulated endpoint")
+    return str(ip)
 
 
 def _attack_runtime_dir(runtime_dir: Path) -> Path:
@@ -113,7 +150,7 @@ def _write_schedule_event(runtime_dir: Path, row: dict[str, Any]) -> None:
         "scenario": row.get("attack"),
         "target": row.get("target"),
         "event": action,
-        "active": action == "attack_on",
+        "active": action in {"attack_on", "dos_start"},
         "active_window": row.get("active_window"),
         "proxy_pid": row.get("proxy_pid"),
         "message": row.get("message"),
@@ -199,12 +236,39 @@ def _target_port(scenario: dict[str, Any]) -> int:
     return int(intercept.get("port", scenario.get("target_port", 502)))
 
 
+def _dos_target_port(scenario: dict[str, Any]) -> int:
+    target = scenario.get("target", {}) or {}
+    return int(target.get("port", scenario.get("target_port", 502)))
+
+
 def _attacker_endpoint(scenario: dict[str, Any]) -> str:
     attacker = scenario.get("attacker", {}) or {}
     endpoint = attacker.get("endpoint", scenario.get("attacker_endpoint", ""))
     if not endpoint:
         raise ValueError(f"attack {scenario.get('name')} missing attacker.endpoint")
     return str(endpoint)
+
+
+def _dos_target_endpoint(scenario: dict[str, Any]) -> str:
+    target = scenario.get("target", {}) or {}
+    endpoint = target.get("endpoint", scenario.get("target_endpoint", ""))
+    if not endpoint:
+        raise ValueError(f"attack {scenario.get('name')} missing target.endpoint")
+    return str(endpoint)
+
+
+def _dos_pid_key(source: str, target: str) -> str:
+    return f"{source}_{target}"
+
+
+def _dos_traffic(scenario: dict[str, Any]) -> dict[str, Any]:
+    traffic = scenario.get("traffic", {}) or {}
+    if not isinstance(traffic, dict):
+        raise ValueError(f"attack {scenario.get('name')} traffic must be a mapping")
+    mode = str(traffic.get("mode", "cbr")).lower()
+    if mode != "cbr":
+        raise ValueError(f"attack {scenario.get('name')} only supports traffic.mode=cbr")
+    return traffic
 
 
 def _trigger(scenario: dict[str, Any]) -> dict[str, Any]:
@@ -450,6 +514,8 @@ def _iter_mitm_targets(cfg: dict[str, Any], rt, runtime_dir: Path):  # type: ign
     scada_ns = _scada_namespace(cfg)
     for scenario in _scenario_list(cfg):
         attack_type = str(scenario.get("type", "")).lower()
+        if attack_type in SUPPORTED_DOS_TYPES:
+            continue
         if attack_type not in SUPPORTED_MITM_TYPES:
             print(f"[ATTACK] skip unsupported attack type={attack_type} name={scenario.get('name')}", flush=True)
             continue
@@ -467,6 +533,177 @@ def _iter_mitm_targets(cfg: dict[str, Any], rt, runtime_dir: Path):  # type: ign
             target_port = _target_port(scenario)
             listen_port = _listen_port(scenario, idx, target_key)
             yield scenario, idx, target_key, scada_ns, attacker_ip, target_ip, target_port, listen_port
+
+
+def _resolve_dos_target_ip(cfg: dict[str, Any], rt, scenario: dict[str, Any], target_endpoint: str) -> str:  # type: ignore[no-untyped-def]
+    target_entry = _endpoint_entry(cfg, target_endpoint)
+    target_key = target_endpoint.upper() if target_endpoint.upper().startswith("PLC") else target_endpoint
+    if str(target_entry.get("role", "")).lower() == "plc":
+        if target_key not in rt.plcs:
+            raise ValueError(f"DoS target {target_endpoint} is not a PLC in runtime config")
+        resolved_ip = rt.plcs[target_key].ip
+    else:
+        resolved_ip = _endpoint_ip(cfg, target_endpoint)
+    if not resolved_ip:
+        raise ValueError(f"DoS target {target_endpoint} has no resolved IP")
+
+    target_cfg = scenario.get("target", {}) or {}
+    configured_ip = target_cfg.get("ip")
+    if configured_ip:
+        configured = str(ipaddress.ip_interface(str(configured_ip)).ip)
+        if configured != resolved_ip:
+            raise ValueError(
+                f"DoS target.ip mismatch for {target_endpoint}: configured {configured}, resolved {resolved_ip}"
+            )
+    return _require_internal_ip(cfg, resolved_ip)
+
+
+def _dos_spec(cfg: dict[str, Any], rt, scenario: dict[str, Any]) -> dict[str, Any]:  # type: ignore[no-untyped-def]
+    name = str(scenario.get("name"))
+    source = _attacker_endpoint(scenario)
+    target = _dos_target_endpoint(scenario)
+    attacker_entry = _endpoint_entry(cfg, source)
+    _endpoint_entry(cfg, target)
+
+    attacker_cfg = scenario.get("attacker", {}) or {}
+    attacker_ns = str(attacker_cfg.get("namespace") or attacker_entry.get("namespace") or _endpoint_namespace(cfg, source))
+    if not attacker_ns:
+        raise ValueError(f"DoS attack {name} attacker endpoint has no namespace: {source}")
+
+    attacker_ip = _endpoint_ip(cfg, source)
+    configured_attacker_ip = attacker_cfg.get("ip")
+    if configured_attacker_ip:
+        configured = str(ipaddress.ip_interface(str(configured_attacker_ip)).ip)
+        if configured != attacker_ip:
+            raise ValueError(f"DoS attacker.ip mismatch for {source}: configured {configured}, resolved {attacker_ip}")
+
+    target_cfg = scenario.get("target", {}) or {}
+    protocol = str(target_cfg.get("protocol", "udp")).lower()
+    if protocol != "udp":
+        raise ValueError(f"DoS attack {name} only supports UDP, got protocol={protocol}")
+
+    target_ip = _resolve_dos_target_ip(cfg, rt, scenario, target)
+    traffic = _dos_traffic(scenario)
+    rate = str(traffic.get("rate", "500kbps"))
+    packet_size = int(traffic.get("packet_size", 512))
+    if packet_size <= 0:
+        raise ValueError(f"DoS attack {name} packet_size must be positive")
+    if packet_size > 65_507:
+        raise ValueError(f"DoS attack {name} packet_size exceeds maximum UDP payload size")
+
+    return {
+        "name": name,
+        "source": source,
+        "target": target,
+        "pid_key": _dos_pid_key(source, target),
+        "attacker_ns": attacker_ns,
+        "attacker_ip": attacker_ip,
+        "target_ip": target_ip,
+        "target_port": _dos_target_port(scenario),
+        "rate": rate,
+        "packet_size": packet_size,
+        "start_after_sec": float(traffic.get("start_after_sec", 0.0) or 0.0),
+    }
+
+
+def _iter_dos_targets(cfg: dict[str, Any], rt):  # type: ignore[no-untyped-def]
+    for scenario in _scenario_list(cfg):
+        attack_type = str(scenario.get("type", "")).lower()
+        if attack_type not in SUPPORTED_DOS_TYPES:
+            continue
+        yield scenario, _dos_spec(cfg, rt, scenario)
+
+
+def _stop_dos(
+    *,
+    runtime_dir: Path,
+    scenario: dict[str, Any],
+    spec: dict[str, Any],
+    iteration: int | None = None,
+    reason: str = "stop",
+) -> bool:
+    name = spec["name"]
+    pid_key = spec["pid_key"]
+    pid = _running_pid(runtime_dir, name, pid_key)
+    pf = _pid_file(runtime_dir, name, pid_key)
+    stopped = False
+    if pid is not None:
+        _stop_pid(pid)
+        stopped = True
+    try:
+        pf.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    if stopped:
+        _write_schedule_event(runtime_dir, {
+            "timestamp_epoch": f"{time.time():.6f}",
+            "iteration": "" if iteration is None else iteration,
+            "action": "dos_stop",
+            "attack": name,
+            "target": spec["target"],
+            "active_window": _active_window_label(scenario),
+            "proxy_pid": pid,
+            "message": reason,
+        })
+    return stopped
+
+
+def _start_dos(
+    *,
+    args: argparse.Namespace,
+    runtime_dir: Path,
+    scenario: dict[str, Any],
+    spec: dict[str, Any],
+    iteration: int | None = None,
+    reason: str = "inside iteration window",
+) -> bool:
+    name = spec["name"]
+    pid_key = spec["pid_key"]
+    running = _running_pid(runtime_dir, name, pid_key)
+    if running is not None:
+        return False
+
+    project_root = Path(__file__).resolve().parents[2]
+    logs_dir = runtime_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / f"attack_{name}_{spec['source']}_{spec['target']}.log"
+    log = log_path.open("a", encoding="utf-8")
+    cmd = [
+        "ip", "netns", "exec", spec["attacker_ns"],
+        args.python_bin, "-m", "src.attack.udp_dos",
+        "--config", str(args.config.resolve()),
+        "--attack", name,
+        "--source", spec["source"],
+        "--target", spec["target"],
+        "--target-host", spec["target_ip"],
+        "--target-port", str(spec["target_port"]),
+        "--rate", spec["rate"],
+        "--packet-size", str(spec["packet_size"]),
+        "--runtime-dir", str(runtime_dir),
+        "--start-after-sec", str(spec["start_after_sec"]),
+    ]
+    print("[ATTACK] launch", " ".join(cmd), flush=True)
+    proc = subprocess.Popen(cmd, cwd=str(project_root), stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    _pid_file(runtime_dir, name, pid_key).write_text(str(proc.pid), encoding="utf-8")
+    time.sleep(0.2)
+    if proc.poll() is not None:
+        raise RuntimeError(f"DoS process exited early name={name} target={spec['target']}; see {log_path}")
+    _write_schedule_event(runtime_dir, {
+        "timestamp_epoch": f"{time.time():.6f}",
+        "iteration": "" if iteration is None else iteration,
+        "action": "dos_start",
+        "attack": name,
+        "target": spec["target"],
+        "active_window": _active_window_label(scenario),
+        "proxy_pid": proc.pid,
+        "message": (
+            f"{spec['source']} -> {spec['target_ip']}:{spec['target_port']} "
+            f"udp rate={spec['rate']} packet_size={spec['packet_size']} {reason}"
+        ),
+    })
+    return True
 
 
 def stop(args: argparse.Namespace) -> int:
@@ -487,6 +724,9 @@ def stop(args: argparse.Namespace) -> int:
             listen_port=listen_port,
             reason="stop all",
         ):
+            count += 1
+    for scenario, spec in _iter_dos_targets(cfg, rt):
+        if _stop_dos(runtime_dir=runtime_dir, scenario=scenario, spec=spec, reason="stop all"):
             count += 1
     print(f"[ATTACK] stopped configured attack components count={count}", flush=True)
     return 0
@@ -509,6 +749,18 @@ def start(args: argparse.Namespace) -> int:
     launched = 0
     for scenario in scenarios:
         attack_type = str(scenario.get("type", "")).lower()
+        if attack_type in SUPPORTED_DOS_TYPES:
+            spec = _dos_spec(cfg, rt, scenario)
+            if _start_dos(
+                args=args,
+                runtime_dir=runtime_dir,
+                scenario=scenario,
+                spec=spec,
+                iteration=args.iteration,
+                reason="manual start",
+            ):
+                launched += 1
+            continue
         if attack_type not in SUPPORTED_MITM_TYPES:
             print(f"[ATTACK] skip unsupported attack type={attack_type} name={scenario.get('name')}", flush=True)
             continue
@@ -553,6 +805,30 @@ def sync(args: argparse.Namespace) -> int:
 
     for scenario in scenarios:
         attack_type = str(scenario.get("type", "")).lower()
+        if attack_type in SUPPORTED_DOS_TYPES:
+            spec = _dos_spec(cfg, rt, scenario)
+            checked += 1
+            active = _active_at_iteration(scenario, args.iteration, default_active=False)
+            if active:
+                if _start_dos(
+                    args=args,
+                    runtime_dir=runtime_dir,
+                    scenario=scenario,
+                    spec=spec,
+                    iteration=args.iteration,
+                    reason="inside iteration window",
+                ):
+                    started += 1
+            else:
+                if _stop_dos(
+                    runtime_dir=runtime_dir,
+                    scenario=scenario,
+                    spec=spec,
+                    iteration=args.iteration,
+                    reason="iteration window ended",
+                ):
+                    stopped += 1
+            continue
         if attack_type not in SUPPORTED_MITM_TYPES:
             continue
         name = str(scenario.get("name"))
@@ -592,7 +868,7 @@ def sync(args: argparse.Namespace) -> int:
                 "message": "proxy remains online; only modification state changed",
             })
     print(
-        f"[ATTACK] sync iteration={args.iteration} checked={checked} proxy_started={started} proxy_stopped={stopped}",
+        f"[ATTACK] sync iteration={args.iteration} checked={checked} started={started} stopped={stopped}",
         flush=True,
     )
     return 0
