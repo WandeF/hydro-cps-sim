@@ -155,6 +155,7 @@ def launch_daemons(
         "--modbus-workers", str(args.scada_modbus_workers),
         "--connect-retries", str(args.connect_retries),
         "--connect-retry-delay", str(args.connect_retry_delay),
+        "--timeout-grace-iterations", str(args.scada_timeout_grace_iterations),
     ]
     if args.no_batch_modbus:
         scada_runtime_args.append("--no-batch-modbus")
@@ -652,6 +653,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--connect-retries", type=int, default=10)
     p.add_argument("--connect-retry-delay", type=float, default=0.2)
     p.add_argument("--scada-modbus-workers", type=int, default=8, help="Concurrent PLC Modbus workers used by the SCADA daemon")
+    p.add_argument("--scada-timeout-grace-iterations", type=int, default=1, help="Initial SCADA cycles whose Modbus timeouts are warmup-only and excluded from timeout event reports")
     p.add_argument("--no-batch-modbus", action="store_true", help="Disable batched SCADA/PLC Modbus reads/writes")
     p.add_argument("--no-persistent-scada-connections", action="store_true", help="Reconnect SCADA Modbus clients every cycle instead of reusing TCP connections")
     p.add_argument("--no-root-check", action="store_true")

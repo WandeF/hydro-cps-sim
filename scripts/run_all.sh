@@ -228,6 +228,7 @@ kill_stale_python_runtime_processes() {
   # killing unrelated Python jobs as much as possible.
   local patterns=(
     "src.attack.modbus_mitm"
+    "src.attack.udp_dos"
     "src.attack.launch"
     "src.plc.adapter"
     "src.scada.client"

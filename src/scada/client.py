@@ -26,6 +26,17 @@ from src.sync.helics_sync import HelicsSync, coordinator_endpoint, scada_endpoin
 _STOP = False
 
 
+TIMEOUT_MARKERS = (
+    "timed out",
+    "timeout",
+    "no response",
+    "cannot connect",
+    "connection refused",
+    "connection reset",
+    "broken pipe",
+)
+
+
 def _install_signal_handlers() -> None:
     def _handler(signum, frame):  # type: ignore[no-untyped-def]
         global _STOP
@@ -66,6 +77,44 @@ def _batch_modbus_enabled(args: argparse.Namespace) -> bool:
     return not bool(getattr(args, "no_batch_modbus", False))
 
 
+def _is_timeout_like(exc: BaseException | str) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in TIMEOUT_MARKERS)
+
+
+def _mark_timeout(
+    item: dict[str, Any],
+    phase: str,
+    message: str,
+    previous: dict[str, Any] | None = None,
+    *,
+    warmup: bool = False,
+) -> None:
+    item["status"] = "warmup_timeout" if warmup else "timeout"
+    item["timeout"] = not warmup
+    item["warmup_timeout"] = bool(warmup)
+    item["timeout_phase"] = phase
+    label = "warmup timeout" if warmup else "timeout"
+    item["errors"].append(f"{label} {phase}: {message}")
+    if previous:
+        item["used_previous"] = True
+        item["previous_iteration"] = previous.get("iteration", "")
+        item["md"].update(previous.get("md", {}) or {})
+        item["coils"].update(previous.get("coils", {}) or {})
+
+
+def _drop_endpoint(endpoints: dict[str, ModbusEndpoint] | None, plc_name: str) -> None:
+    if endpoints is None or plc_name not in endpoints:
+        return
+    try:
+        endpoints[plc_name].close()
+    finally:
+        try:
+            del endpoints[plc_name]
+        except KeyError:
+            pass
+
+
 def _run_plc_tasks(
     plcs: list[Any],
     args: argparse.Namespace,
@@ -90,13 +139,16 @@ def _poll_one_plc(
     plc: Any,
     args: argparse.Namespace,
     endpoints: dict[str, ModbusEndpoint] | None = None,
+    previous: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
-    item: dict[str, Any] = {"ip": plc.ip, "md": {}, "coils": {}, "errors": []}
+    item: dict[str, Any] = {"ip": plc.ip, "md": {}, "coils": {}, "errors": [], "status": "ok", "timeout": False}
     flat: dict[str, Any] = {}
     if not plc.ip:
+        item["status"] = "error"
         item["errors"].append("no IP in config")
         return plc.name, item, flat
 
+    warmup_timeout = bool(getattr(args, "_timeout_grace_active", False))
     mb: ModbusEndpoint | None = None
     close_after = False
     try:
@@ -111,6 +163,11 @@ def _poll_one_plc(
                         item["md"][var.name] = value
                         flat[var.name] = value
                 except Exception as exc:
+                    if _is_timeout_like(exc):
+                        _drop_endpoint(endpoints, plc.name)
+                        _mark_timeout(item, "poll", f"batch read md: {exc}", previous, warmup=warmup_timeout)
+                        flat.update(item["md"])
+                        return plc.name, item, flat
                     item["errors"].append(f"batch read md: {exc}; fallback to single reads")
                     for var in md_vars:
                         try:
@@ -118,6 +175,11 @@ def _poll_one_plc(
                             item["md"][var.name] = value
                             flat[var.name] = value
                         except Exception as var_exc:
+                            if _is_timeout_like(var_exc):
+                                _drop_endpoint(endpoints, plc.name)
+                                _mark_timeout(item, "poll", f"read {var.name} %MD{var.md_index}: {var_exc}", previous, warmup=warmup_timeout)
+                                flat.update(item["md"])
+                                return plc.name, item, flat
                             item["errors"].append(f"read {var.name} %MD{var.md_index}: {var_exc}")
             else:
                 for var in md_vars:
@@ -126,6 +188,11 @@ def _poll_one_plc(
                         item["md"][var.name] = value
                         flat[var.name] = value
                     except Exception as exc:
+                        if _is_timeout_like(exc):
+                            _drop_endpoint(endpoints, plc.name)
+                            _mark_timeout(item, "poll", f"read {var.name} %MD{var.md_index}: {exc}", previous, warmup=warmup_timeout)
+                            flat.update(item["md"])
+                            return plc.name, item, flat
                         item["errors"].append(f"read {var.name} %MD{var.md_index}: {exc}")
 
         if args.read_coils and plc.coil_vars:
@@ -137,6 +204,12 @@ def _poll_one_plc(
                         item["coils"][var.name] = value
                         flat[var.name] = value
                 except Exception as exc:
+                    if _is_timeout_like(exc):
+                        _drop_endpoint(endpoints, plc.name)
+                        _mark_timeout(item, "poll", f"batch read coils: {exc}", previous, warmup=warmup_timeout)
+                        flat.update(item["md"])
+                        flat.update(item["coils"])
+                        return plc.name, item, flat
                     item["errors"].append(f"batch read coils: {exc}; fallback to single reads")
                     for var in plc.coil_vars.values():
                         try:
@@ -144,6 +217,12 @@ def _poll_one_plc(
                             item["coils"][var.name] = value
                             flat[var.name] = value
                         except Exception as var_exc:
+                            if _is_timeout_like(var_exc):
+                                _drop_endpoint(endpoints, plc.name)
+                                _mark_timeout(item, "poll", f"read {var.name} coil{var.coil_index}: {var_exc}", previous, warmup=warmup_timeout)
+                                flat.update(item["md"])
+                                flat.update(item["coils"])
+                                return plc.name, item, flat
                             item["errors"].append(f"read {var.name} coil{var.coil_index}: {var_exc}")
             else:
                 for var in plc.coil_vars.values():
@@ -152,9 +231,22 @@ def _poll_one_plc(
                         item["coils"][var.name] = value
                         flat[var.name] = value
                     except Exception as exc:
+                        if _is_timeout_like(exc):
+                            _drop_endpoint(endpoints, plc.name)
+                            _mark_timeout(item, "poll", f"read {var.name} coil{var.coil_index}: {exc}", previous, warmup=warmup_timeout)
+                            flat.update(item["md"])
+                            flat.update(item["coils"])
+                            return plc.name, item, flat
                         item["errors"].append(f"read {var.name} coil{var.coil_index}: {exc}")
     except Exception as exc:
-        item["errors"].append(f"connect/read {plc.ip}:{args.port}: {exc}")
+        if _is_timeout_like(exc):
+            _drop_endpoint(endpoints, plc.name)
+            _mark_timeout(item, "poll", f"connect/read {plc.ip}:{args.port}: {exc}", previous, warmup=warmup_timeout)
+            flat.update(item["md"])
+            flat.update(item["coils"])
+        else:
+            item["status"] = "error"
+            item["errors"].append(f"connect/read {plc.ip}:{args.port}: {exc}")
     finally:
         if close_after and mb is not None:
             mb.close()
@@ -166,6 +258,7 @@ def _poll_runtime(
     rt: RuntimeConfig,
     args: argparse.Namespace,
     endpoints: dict[str, ModbusEndpoint] | None = None,
+    previous_poll: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {"plcs": {}, "flat": {}}
     plcs = [plc for plc in rt.plcs.values() if plc.ip]
@@ -173,11 +266,14 @@ def _poll_runtime(
     for plc in missing:
         print(f"[SCADA] skip {plc.name}: no IP in config", flush=True)
 
-    results = _run_plc_tasks(plcs, args, lambda plc: _poll_one_plc(plc, args, endpoints))
+    previous_poll = previous_poll or {}
+    results = _run_plc_tasks(plcs, args, lambda plc: _poll_one_plc(plc, args, endpoints, previous_poll.get(plc.name)))
     for plc_name, item, flat in results:
         payload["plcs"][plc_name] = item
         payload["flat"].update(flat)
-        print(f"[SCADA] poll {plc_name:5s} ip={item.get('ip', ''):15s} md={len(item['md'])} coils={len(item['coils'])} errors={len(item['errors'])}", flush=True)
+        status = item.get("status", "ok")
+        prev = " previous" if item.get("used_previous") else ""
+        print(f"[SCADA] poll {plc_name:5s} ip={item.get('ip', ''):15s} status={status}{prev} md={len(item['md'])} coils={len(item['coils'])} errors={len(item['errors'])}", flush=True)
         for err in item["errors"]:
             print(f"  [ERR] {err}", flush=True)
 
@@ -195,7 +291,7 @@ def _prepare_downlink_writes(
     poll_payload: dict[str, Any],
     physics_values: dict[str, Any],
 ) -> tuple[dict[str, Any], list[tuple[MdVar, float, str]]]:
-    item: dict[str, Any] = {"ip": plc.ip, "written": {}, "skipped": {}, "errors": []}
+    item: dict[str, Any] = {"ip": plc.ip, "written": {}, "skipped": {}, "errors": [], "status": "ok", "timeout": False}
     writes: list[tuple[MdVar, float, str]] = []
 
     for var in plc.md_vars.values():
@@ -231,6 +327,10 @@ def _downlink_one_plc(
 
     mb: ModbusEndpoint | None = None
     close_after = False
+    warmup_timeout = bool(getattr(args, "_timeout_grace_active", False))
+    timeout_status = "warmup_timeout" if warmup_timeout else "timeout"
+    timeout_flag = not warmup_timeout
+    timeout_label = "warmup timeout" if warmup_timeout else "timeout"
     try:
         mb, close_after = _get_or_open_endpoint(plc, args, endpoints)
         if _batch_modbus_enabled(args):
@@ -240,6 +340,14 @@ def _downlink_one_plc(
                     item["written"][var.name] = {"value": value, "source": source, "md_index": var.md_index}
                     flat[var.name] = value
             except Exception as exc:
+                if _is_timeout_like(exc):
+                    _drop_endpoint(endpoints, plc.name)
+                    item["status"] = timeout_status
+                    item["timeout"] = timeout_flag
+                    item["warmup_timeout"] = warmup_timeout
+                    item["timeout_phase"] = "downlink"
+                    item["errors"].append(f"{timeout_label} downlink: batch write md: {exc}")
+                    return plc.name, item, flat
                 item["errors"].append(f"batch write md: {exc}; fallback to single writes")
                 for var, value, source in writes:
                     try:
@@ -247,6 +355,14 @@ def _downlink_one_plc(
                         item["written"][var.name] = {"value": value, "source": source, "md_index": var.md_index}
                         flat[var.name] = value
                     except Exception as var_exc:
+                        if _is_timeout_like(var_exc):
+                            _drop_endpoint(endpoints, plc.name)
+                            item["status"] = timeout_status
+                            item["timeout"] = timeout_flag
+                            item["warmup_timeout"] = warmup_timeout
+                            item["timeout_phase"] = "downlink"
+                            item["errors"].append(f"{timeout_label} downlink: write {var.name} %MD{var.md_index}: {var_exc}")
+                            return plc.name, item, flat
                         item["errors"].append(f"write {var.name} %MD{var.md_index}: {var_exc}")
         else:
             for var, value, source in writes:
@@ -255,9 +371,26 @@ def _downlink_one_plc(
                     item["written"][var.name] = {"value": value, "source": source, "md_index": var.md_index}
                     flat[var.name] = value
                 except Exception as exc:
+                    if _is_timeout_like(exc):
+                        _drop_endpoint(endpoints, plc.name)
+                        item["status"] = timeout_status
+                        item["timeout"] = timeout_flag
+                        item["warmup_timeout"] = warmup_timeout
+                        item["timeout_phase"] = "downlink"
+                        item["errors"].append(f"{timeout_label} downlink: write {var.name} %MD{var.md_index}: {exc}")
+                        return plc.name, item, flat
                     item["errors"].append(f"write {var.name} %MD{var.md_index}: {exc}")
     except Exception as exc:
-        item["errors"].append(f"connect/write {plc.ip}:{args.port}: {exc}")
+        if _is_timeout_like(exc):
+            _drop_endpoint(endpoints, plc.name)
+            item["status"] = timeout_status
+            item["timeout"] = timeout_flag
+            item["warmup_timeout"] = warmup_timeout
+            item["timeout_phase"] = "downlink"
+            item["errors"].append(f"{timeout_label} downlink: connect/write {plc.ip}:{args.port}: {exc}")
+        else:
+            item["status"] = "error"
+            item["errors"].append(f"connect/write {plc.ip}:{args.port}: {exc}")
     finally:
         if close_after and mb is not None:
             mb.close()
@@ -290,7 +423,8 @@ def _downlink_runtime(
     for plc_name, item, flat in results:
         payload["plcs"][plc_name] = item
         payload["flat"].update(flat)
-        print(f"[SCADA] downlink {plc_name:5s} ip={item.get('ip', ''):15s} written={len(item['written'])} skipped={len(item['skipped'])} errors={len(item['errors'])}", flush=True)
+        status = item.get("status", "ok")
+        print(f"[SCADA] downlink {plc_name:5s} ip={item.get('ip', ''):15s} status={status} written={len(item['written'])} skipped={len(item['skipped'])} errors={len(item['errors'])}", flush=True)
         for name, meta in item["written"].items():
             print(f"  WRITE {name:16s} %MD{meta['md_index']:<3d} = {meta['value']} from {meta['source']}", flush=True)
         for err in item["errors"]:
@@ -304,9 +438,13 @@ def _write_scada_csv(runtime_dir: Path, iteration: int, poll_payload: dict[str, 
     total_poll_md = 0
     total_poll_coils = 0
     total_poll_errors = 0
+    total_poll_timeouts = 0
+    total_poll_warmup_timeouts = 0
     total_downlink_written = 0
     total_downlink_skipped = 0
     total_downlink_errors = 0
+    total_downlink_timeouts = 0
+    total_downlink_warmup_timeouts = 0
 
     for plc_name, item in sorted((poll_payload.get("plcs", {}) or {}).items()):
         prefix = f"poll.{plc_name}"
@@ -314,6 +452,11 @@ def _write_scada_csv(runtime_dir: Path, iteration: int, poll_payload: dict[str, 
         coils = item.get("coils", {}) or {}
         errors = item.get("errors", []) or []
         row[f"{prefix}.ip"] = item.get("ip", "")
+        row[f"{prefix}.status"] = item.get("status", "ok")
+        row[f"{prefix}.timeout"] = bool(item.get("timeout", False))
+        row[f"{prefix}.warmup_timeout"] = bool(item.get("warmup_timeout", False))
+        row[f"{prefix}.used_previous"] = bool(item.get("used_previous", False))
+        row[f"{prefix}.previous_iteration"] = item.get("previous_iteration", "")
         row[f"{prefix}.md_count"] = len(md)
         row[f"{prefix}.coil_count"] = len(coils)
         row[f"{prefix}.error_count"] = len(errors)
@@ -326,6 +469,8 @@ def _write_scada_csv(runtime_dir: Path, iteration: int, poll_payload: dict[str, 
         total_poll_md += len(md)
         total_poll_coils += len(coils)
         total_poll_errors += len(errors)
+        total_poll_timeouts += 1 if item.get("timeout") else 0
+        total_poll_warmup_timeouts += 1 if item.get("warmup_timeout") else 0
 
     for plc_name, item in sorted((downlink_payload.get("plcs", {}) or {}).items()):
         prefix = f"downlink.{plc_name}"
@@ -333,6 +478,9 @@ def _write_scada_csv(runtime_dir: Path, iteration: int, poll_payload: dict[str, 
         skipped = item.get("skipped", {}) or {}
         errors = item.get("errors", []) or []
         row[f"{prefix}.ip"] = item.get("ip", "")
+        row[f"{prefix}.status"] = item.get("status", "ok")
+        row[f"{prefix}.timeout"] = bool(item.get("timeout", False))
+        row[f"{prefix}.warmup_timeout"] = bool(item.get("warmup_timeout", False))
         row[f"{prefix}.written_count"] = len(written)
         row[f"{prefix}.skipped_count"] = len(skipped)
         row[f"{prefix}.error_count"] = len(errors)
@@ -345,14 +493,20 @@ def _write_scada_csv(runtime_dir: Path, iteration: int, poll_payload: dict[str, 
         total_downlink_written += len(written)
         total_downlink_skipped += len(skipped)
         total_downlink_errors += len(errors)
+        total_downlink_timeouts += 1 if item.get("timeout") else 0
+        total_downlink_warmup_timeouts += 1 if item.get("warmup_timeout") else 0
 
     row.update({
         "poll_md_total": total_poll_md,
         "poll_coil_total": total_poll_coils,
         "poll_error_total": total_poll_errors,
+        "poll_timeout_total": total_poll_timeouts,
+        "poll_warmup_timeout_total": total_poll_warmup_timeouts,
         "downlink_written_total": total_downlink_written,
         "downlink_skipped_total": total_downlink_skipped,
         "downlink_error_total": total_downlink_errors,
+        "downlink_timeout_total": total_downlink_timeouts,
+        "downlink_warmup_timeout_total": total_downlink_warmup_timeouts,
     })
 
     append_row(
@@ -363,9 +517,13 @@ def _write_scada_csv(runtime_dir: Path, iteration: int, poll_payload: dict[str, 
             "poll_md_total",
             "poll_coil_total",
             "poll_error_total",
+            "poll_timeout_total",
+            "poll_warmup_timeout_total",
             "downlink_written_total",
             "downlink_skipped_total",
             "downlink_error_total",
+            "downlink_timeout_total",
+            "downlink_warmup_timeout_total",
         ],
     )
 
@@ -392,13 +550,16 @@ def _write_scada_observed_csv(runtime_dir: Path, iteration: int, poll_payload: d
     ]
 
     for plc_name, item in sorted((poll_payload.get("plcs", {}) or {}).items()):
+        source = "modbus_timeout_previous" if item.get("timeout") and item.get("used_previous") else "modbus_poll"
+        if item.get("warmup_timeout") and item.get("used_previous"):
+            source = "modbus_warmup_previous"
         for name, value in sorted((item.get("md", {}) or {}).items()):
             row = {
                 "iteration": iteration,
                 "plc": plc_name,
                 "variable": name,
                 "value": value,
-                "source": "modbus_poll",
+                "source": source,
                 "direction": "response",
                 "timestamp_epoch": observed_at,
                 "kind": "md",
@@ -415,7 +576,7 @@ def _write_scada_observed_csv(runtime_dir: Path, iteration: int, poll_payload: d
                 "plc": plc_name,
                 "variable": name,
                 "value": value,
-                "source": "modbus_poll",
+                "source": source,
                 "direction": "response",
                 "timestamp_epoch": observed_at,
                 "kind": "coil",
@@ -444,37 +605,91 @@ def _write_scada_timing_csv(runtime_dir: Path, timing: dict[str, Any]) -> None:
             "poll_md_total",
             "poll_coil_total",
             "poll_error_total",
+            "poll_timeout_total",
+            "poll_warmup_timeout_total",
             "downlink_written_total",
             "downlink_skipped_total",
             "downlink_error_total",
+            "downlink_timeout_total",
+            "downlink_warmup_timeout_total",
         ],
     )
+
+
+def _write_scada_timeout_events(
+    runtime_dir: Path,
+    iteration: int,
+    phase: str,
+    payload: dict[str, Any],
+) -> None:
+    timestamp = f"{time.time():.6f}"
+    fixed_columns = [
+        "timestamp_epoch",
+        "iteration",
+        "phase",
+        "plc",
+        "ip",
+        "status",
+        "warmup",
+        "used_previous",
+        "previous_iteration",
+        "message",
+    ]
+    for plc_name, item in sorted((payload.get("plcs", {}) or {}).items()):
+        if not item.get("timeout"):
+            continue
+        row = {
+            "timestamp_epoch": timestamp,
+            "iteration": iteration,
+            "phase": phase,
+            "plc": plc_name,
+            "ip": item.get("ip", ""),
+            "status": "timeout",
+            "warmup": False,
+            "used_previous": bool(item.get("used_previous", False)),
+            "previous_iteration": item.get("previous_iteration", ""),
+            "message": " | ".join(str(err) for err in (item.get("errors", []) or [])),
+        }
+        append_jsonl(raw_dir(runtime_dir) / "scada_timeout_events.jsonl", row)
+        append_row(csv_dir(runtime_dir) / "scada_timeout_events.csv", row, fixed_columns=fixed_columns)
 
 
 def _count_scada_payloads(poll_payload: dict[str, Any], downlink_payload: dict[str, Any]) -> dict[str, int]:
     poll_md_total = 0
     poll_coil_total = 0
     poll_error_total = 0
+    poll_timeout_total = 0
+    poll_warmup_timeout_total = 0
     for item in (poll_payload.get("plcs", {}) or {}).values():
         poll_md_total += len(item.get("md", {}) or {})
         poll_coil_total += len(item.get("coils", {}) or {})
         poll_error_total += len(item.get("errors", []) or [])
+        poll_timeout_total += 1 if item.get("timeout") else 0
+        poll_warmup_timeout_total += 1 if item.get("warmup_timeout") else 0
 
     downlink_written_total = 0
     downlink_skipped_total = 0
     downlink_error_total = 0
+    downlink_timeout_total = 0
+    downlink_warmup_timeout_total = 0
     for item in (downlink_payload.get("plcs", {}) or {}).values():
         downlink_written_total += len(item.get("written", {}) or {})
         downlink_skipped_total += len(item.get("skipped", {}) or {})
         downlink_error_total += len(item.get("errors", []) or [])
+        downlink_timeout_total += 1 if item.get("timeout") else 0
+        downlink_warmup_timeout_total += 1 if item.get("warmup_timeout") else 0
 
     return {
         "poll_md_total": poll_md_total,
         "poll_coil_total": poll_coil_total,
         "poll_error_total": poll_error_total,
+        "poll_timeout_total": poll_timeout_total,
+        "poll_warmup_timeout_total": poll_warmup_timeout_total,
         "downlink_written_total": downlink_written_total,
         "downlink_skipped_total": downlink_skipped_total,
         "downlink_error_total": downlink_error_total,
+        "downlink_timeout_total": downlink_timeout_total,
+        "downlink_warmup_timeout_total": downlink_warmup_timeout_total,
     }
 
 
@@ -542,6 +757,7 @@ def daemon(args: argparse.Namespace) -> int:
         endpoints = _connect_scada_endpoints(rt, args)
         print(f"[SCADA-DAEMON] persistent Modbus connections={len(endpoints)}", flush=True)
 
+    previous_poll: dict[str, dict[str, Any]] = {}
     iteration = args.start_iteration
     try:
         while not _STOP and not stop_requested(sync_dir):
@@ -550,6 +766,8 @@ def daemon(args: argparse.Namespace) -> int:
             try:
                 cycle_t0 = time.monotonic()
                 timing: dict[str, Any] = {"iteration": iteration}
+                grace_end_iteration = args.start_iteration + max(0, int(args.timeout_grace_iterations or 0))
+                args._timeout_grace_active = iteration < grace_end_iteration
 
                 wait_t0 = time.monotonic()
                 if args.sync_backend == "helics":
@@ -567,9 +785,19 @@ def daemon(args: argparse.Namespace) -> int:
 
                 poll_path = out_json_dir / f"scada_poll_{iteration:04d}.json"
                 poll_t0 = time.monotonic()
-                poll_payload = _poll_runtime(rt, args, endpoints=endpoints)
+                poll_payload = _poll_runtime(rt, args, endpoints=endpoints, previous_poll=previous_poll)
                 write_json(poll_path, poll_payload)
                 _write_scada_observed_csv(runtime_dir, iteration, poll_payload)
+                _write_scada_timeout_events(runtime_dir, iteration, "poll", poll_payload)
+                for plc_name, item in (poll_payload.get("plcs", {}) or {}).items():
+                    if item.get("timeout") or item.get("used_previous"):
+                        continue
+                    if item.get("md") or item.get("coils"):
+                        previous_poll[plc_name] = {
+                            "iteration": iteration,
+                            "md": dict(item.get("md", {}) or {}),
+                            "coils": dict(item.get("coils", {}) or {}),
+                        }
                 timing["poll_sec"] = time.monotonic() - poll_t0
 
                 read_physics_t0 = time.monotonic()
@@ -584,6 +812,7 @@ def daemon(args: argparse.Namespace) -> int:
                 downlink_t0 = time.monotonic()
                 downlink_payload = _downlink_runtime(rt, args, poll_payload, physics_values, endpoints=endpoints)
                 write_json(downlink_path, downlink_payload)
+                _write_scada_timeout_events(runtime_dir, iteration, "downlink", downlink_payload)
                 timing["downlink_sec"] = time.monotonic() - downlink_t0
 
                 csv_t0 = time.monotonic()
@@ -682,6 +911,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_daemon.add_argument("--helics-log-level", type=int, default=1)
     p_daemon.add_argument("--connect-retries", type=int, default=10)
     p_daemon.add_argument("--connect-retry-delay", type=float, default=0.2)
+    p_daemon.add_argument(
+        "--timeout-grace-iterations",
+        type=int,
+        default=1,
+        help="Initial SCADA cycles whose Modbus timeouts are treated as warmup timeouts, not attack timeout events",
+    )
     p_daemon.add_argument("--no-persistent-scada-connections", action="store_true", help="Reconnect for each SCADA poll/downlink instead of reusing Modbus connections")
     p_daemon.add_argument("--keep-running-on-error", action="store_true")
     p_daemon.set_defaults(func=daemon)

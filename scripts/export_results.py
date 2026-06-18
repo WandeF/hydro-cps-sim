@@ -213,8 +213,18 @@ def export_attack_events(runtime_dir: Path, reports_csv_dir: Path) -> Path:
     columns = [
         "iteration",
         "scenario",
+        "attack",
+        "event",
         "rule",
+        "source",
         "target",
+        "target_ip",
+        "target_port",
+        "protocol",
+        "rate",
+        "packet_size",
+        "packets",
+        "bytes",
         "variable",
         "direction",
         "function_code",
@@ -222,11 +232,15 @@ def export_attack_events(runtime_dir: Path, reports_csv_dir: Path) -> Path:
         "new_value",
         "timestamp_epoch",
         "transaction_id",
+        "message",
     ]
     out_rows = []
     for row in rows:
+        scenario = row.get("scenario", row.get("attack", ""))
         out_rows.append({
             **row,
+            "scenario": scenario,
+            "attack": row.get("attack", scenario),
             "iteration": "" if row.get("iteration") in {None, ""} else _iteration(row),
             "old_value": _fmt(row.get("old_value")),
             "new_value": _fmt(row.get("new_value")),
@@ -256,6 +270,28 @@ def export_attack_schedule(runtime_dir: Path, reports_csv_dir: Path) -> Path:
     columns = ["iteration", "scenario", "target", "event", "active", "timestamp_epoch", "active_window", "proxy_pid", "message"]
     rows.sort(key=lambda r: (_iteration(r), str(r.get("scenario", "")), str(r.get("target", ""))))
     out = reports_csv_dir / "attack_schedule.csv"
+    _write_csv(out, rows, columns)
+    return out
+
+
+def export_scada_timeout_events(runtime_dir: Path, reports_csv_dir: Path) -> Path:
+    rows = _read_jsonl(runtime_dir / "raw" / "scada_timeout_events.jsonl")
+    if not rows:
+        rows = [dict(row) for row in _read_csv(runtime_dir / "csv" / "scada_timeout_events.csv")]
+    columns = [
+        "timestamp_epoch",
+        "iteration",
+        "phase",
+        "plc",
+        "ip",
+        "status",
+        "warmup",
+        "used_previous",
+        "previous_iteration",
+        "message",
+    ]
+    rows.sort(key=lambda r: (_iteration(r), str(r.get("phase", "")), str(r.get("plc", ""))))
+    out = reports_csv_dir / "scada_timeout_events.csv"
     _write_csv(out, rows, columns)
     return out
 
@@ -326,6 +362,7 @@ def export_all(config: Path, runtime_dir: Path | None = None, reports_dir: Path 
         outputs[path.stem] = path
     outputs["attack_events"] = export_attack_events(runtime_dir, reports_csv_dir)
     outputs["attack_schedule"] = export_attack_schedule(runtime_dir, reports_csv_dir)
+    outputs["scada_timeout_events"] = export_scada_timeout_events(runtime_dir, reports_csv_dir)
     outputs["cycle_timing"] = export_cycle_timing(runtime_dir, reports_csv_dir)
     sync_compat_csv(reports_csv_dir, runtime_dir)
     return outputs
