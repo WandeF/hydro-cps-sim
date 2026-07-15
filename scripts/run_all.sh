@@ -11,6 +11,7 @@ SKIP_PREP=0
 SKIP_COMPILE=0
 SKIP_NS3=0
 NS3_START_WAIT="${NS3_START_WAIT:-2}"
+NS3_READY_TIMEOUT="${NS3_READY_TIMEOUT:-180}"
 POLL_INTERVAL="${POLL_INTERVAL:-0.005}"
 SYNC_BACKEND="${SYNC_BACKEND:-filesystem}"
 HELICS_CORE_TYPE="${HELICS_CORE_TYPE:-ipc}"
@@ -34,6 +35,9 @@ PRE_CLEAN_STALE_RUNTIME="${PRE_CLEAN_STALE_RUNTIME:-1}"
 CLEAN_STALE_NETWORK_ON_EXIT="${CLEAN_STALE_NETWORK_ON_EXIT:-1}"
 EXPORT_RESULTS_ON_EXIT="${EXPORT_RESULTS_ON_EXIT:-1}"
 EXPORT_RESULTS_DONE=0
+NETWORK_ANALYSIS_DONE=0
+NETWORK_OUTPUTS_PREPARED=0
+RUN_OUTPUTS_INITIALIZED=0
 
 usage() {
   cat <<EOF
@@ -68,6 +72,7 @@ Options:
 Environment:
   PYTHON_BIN          Python executable visible from namespaces
   NS3_START_WAIT      Seconds to wait after starting ns-3. Default: 2
+  NS3_READY_TIMEOUT   Maximum seconds to wait for ns-3 build/start readiness. Default: 180
   POLL_INTERVAL       Filesystem marker polling interval. Default: 0.005
   SYNC_BACKEND        filesystem or helics. Default: filesystem
   HELICS_CORE_TYPE    HELICS core type. Default: ipc
@@ -293,9 +298,64 @@ export_results() {
   sudo_maybe "$PYTHON_BIN" "$PROJECT_ROOT/scripts/export_results.py" \
     --config "$CONFIG" \
     --runtime-dir "$OUTPUT_DIR/runtime" \
-    --reports-dir "$OUTPUT_DIR/reports"
+    --reports-dir "$OUTPUT_DIR/reports" || return $?
   sudo_maybe chown -R "$(id -u):$(id -g)" "$OUTPUT_DIR/reports" 2>/dev/null || true
   EXPORT_RESULTS_DONE=1
+}
+
+initialize_experiment_outputs() {
+  sudo_maybe rm -f "$OUTPUT_DIR/runtime/run_started.json" || return $?
+  sudo_maybe "$PYTHON_BIN" "$PROJECT_ROOT/scripts/write_experiment_manifest.py" \
+    --config "$CONFIG" \
+    --runtime-dir "$OUTPUT_DIR/runtime" || return $?
+  RUN_OUTPUTS_INITIALIZED=1
+}
+
+analyze_network_results() {
+  if [[ "${NETWORK_ANALYSIS_DONE:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ "$SKIP_NS3" == "1" ]]; then
+    echo "[NETWORK-METRICS] skipped because ns-3 was not started"
+    NETWORK_ANALYSIS_DONE=1
+    return 0
+  fi
+  if [[ "${NETWORK_OUTPUTS_PREPARED:-0}" != "1" ]]; then
+    echo "[NETWORK-METRICS] skipped because this run did not prepare network outputs"
+    return 0
+  fi
+  "$PYTHON_BIN" "$PROJECT_ROOT/scripts/analyze_network.py" --config "$CONFIG" || return $?
+  NETWORK_ANALYSIS_DONE=1
+}
+
+prepare_network_metric_outputs() {
+  local network_dir="$OUTPUT_DIR/runtime/network"
+  local csv_dir="$OUTPUT_DIR/runtime/csv"
+  local reports_dir="$OUTPUT_DIR/reports"
+  # Network files represent exactly one execution.  Clear them even when the
+  # caller keeps other runtime outputs with CLEAN_RUNTIME=0, so analysis can
+  # never silently consume FlowMonitor/link/PCAP data from an earlier run.
+  sudo_maybe mkdir -p "$network_dir" "$csv_dir" || return $?
+  sudo_maybe rm -f \
+    "$network_dir/flow-monitor.xml" \
+    "$network_dir/link-metrics.csv" \
+    "$network_dir/link-metrics.csv.tmp" \
+    "$network_dir/network-aggregate.json" \
+    "$network_dir/ns3.stop" \
+    "$csv_dir/network.csv" || return $?
+  sudo_maybe rm -rf "$network_dir/pcap" || return $?
+  sudo_maybe rm -rf \
+    "$OUTPUT_DIR/runtime/raw/metric_writer_stats" \
+    "$reports_dir/metric_writer_stats" || return $?
+  sudo_maybe mkdir -p "$network_dir/pcap" || return $?
+  sudo_maybe rm -f \
+    "$reports_dir/csv/network.csv" \
+    "$reports_dir/network/network-aggregate.json" \
+    "$reports_dir/network/flow-monitor.xml" \
+    "$reports_dir/network/link-metrics.csv" || return $?
+  sudo_maybe rm -rf "$reports_dir/metrics" || return $?
+  sudo_maybe chown -R "$(id -u):$(id -g)" "$network_dir" "$csv_dir" 2>/dev/null || true
+  NETWORK_OUTPUTS_PREPARED=1
 }
 
 compare_attack_results() {
@@ -320,6 +380,8 @@ cleanup() {
     kill -TERM -- "-$NS3_PID" 2>/dev/null || sudo -n kill -TERM -- "-$NS3_PID" 2>/dev/null || sudo kill -TERM -- "-$NS3_PID" 2>/dev/null || true
     sleep 1
     kill -KILL -- "-$NS3_PID" 2>/dev/null || sudo -n kill -KILL -- "-$NS3_PID" 2>/dev/null || sudo kill -KILL -- "-$NS3_PID" 2>/dev/null || true
+    wait "$NS3_PID" 2>/dev/null || true
+    NS3_PID=""
   fi
   if [[ "${STOP_ATTACKS_ON_EXIT:-1}" == "1" ]]; then
     echo "[CLEANUP] stopping configured attack runtime"
@@ -328,7 +390,10 @@ cleanup() {
   if [[ "${STOP_PLC_ON_EXIT:-1}" == "1" ]]; then
     stop_plc_runtimes || true
   fi
-  if [[ "${EXPORT_RESULTS_ON_EXIT:-1}" == "1" ]]; then
+  if [[ "${RUN_OUTPUTS_INITIALIZED:-0}" == "1" && -f "$OUTPUT_DIR/runtime/run_started.json" ]]; then
+    analyze_network_results || true
+  fi
+  if [[ "${EXPORT_RESULTS_ON_EXIT:-1}" == "1" && "${RUN_OUTPUTS_INITIALIZED:-0}" == "1" && -f "$OUTPUT_DIR/runtime/run_started.json" ]]; then
     export_results || true
   fi
   if [[ "${CLEAN_STALE_NETWORK_ON_EXIT:-1}" == "1" ]]; then
@@ -473,6 +538,7 @@ run_ns3() {
   local src_cc="$OUTPUT_DIR/ns3_network.cc"
   local scratch_cc="$NS3_PATH/scratch/ns3_network.cc"
   local log_file="$LOG_DIR/ns3_network.log"
+  local stop_file="$OUTPUT_DIR/runtime/network/ns3.stop"
 
   if [[ ! -f "$src_cc" ]]; then
     echo "[ERROR] ns-3 source not found: $src_cc" >&2
@@ -512,6 +578,8 @@ run_ns3() {
   echo "[NS3] cmd    : cd $NS3_PATH && setsid $ns3_cmd"
 
   : > "$log_file"
+  mkdir -p "$(dirname "$stop_file")"
+  rm -f "$stop_file"
   local pid_file="$LOG_DIR/ns3_network.pid"
   rm -f "$pid_file"
 
@@ -533,14 +601,60 @@ run_ns3() {
     NS3_PID="$launcher_pid"
   fi
 
-  sleep "$NS3_START_WAIT"
-
+  local ready=0
+  local ready_deadline=$((SECONDS + NS3_READY_TIMEOUT))
+  while (( SECONDS < ready_deadline )); do
+    if grep -Fq "ns3 network started." "$log_file" 2>/dev/null; then
+      ready=1
+      break
+    fi
+    if ! kill -0 "$NS3_PID" 2>/dev/null; then
+      echo "[ERROR] ns-3 exited before reporting ready. Tail of log:" >&2
+      tail -n 80 "$log_file" >&2 || true
+      exit 1
+    fi
+    sleep 0.2
+  done
+  if [[ "$ready" != "1" ]]; then
+    echo "[ERROR] ns-3 did not report ready within ${NS3_READY_TIMEOUT}s. Tail of log:" >&2
+    tail -n 80 "$log_file" >&2 || true
+    exit 1
+  fi
+  if [[ "$NS3_START_WAIT" != "0" ]]; then
+    sleep "$NS3_START_WAIT"
+  fi
   if ! kill -0 "$NS3_PID" 2>/dev/null; then
-    echo "[ERROR] ns-3 exited early. Tail of log:" >&2
+    echo "[ERROR] ns-3 exited immediately after reporting ready. Tail of log:" >&2
     tail -n 80 "$log_file" >&2 || true
     exit 1
   fi
   echo "[NS3] started pid=$NS3_PID"
+}
+
+stop_ns3_gracefully() {
+  if [[ -z "$NS3_PID" ]]; then
+    return 0
+  fi
+  local stop_file="$OUTPUT_DIR/runtime/network/ns3.stop"
+  mkdir -p "$(dirname "$stop_file")"
+  touch "$stop_file"
+  echo "[NS3] graceful stop requested: $stop_file"
+  for _ in $(seq 1 100); do
+    if ! kill -0 "$NS3_PID" 2>/dev/null; then
+      wait "$NS3_PID" 2>/dev/null || true
+      echo "[NS3] stopped after flushing network metrics"
+      NS3_PID=""
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "[NS3][WARN] graceful stop timed out; terminating process group pid=$NS3_PID" >&2
+  kill -TERM -- "-$NS3_PID" 2>/dev/null || sudo -n kill -TERM -- "-$NS3_PID" 2>/dev/null || true
+  sleep 0.5
+  kill -KILL -- "-$NS3_PID" 2>/dev/null || sudo -n kill -KILL -- "-$NS3_PID" 2>/dev/null || true
+  wait "$NS3_PID" 2>/dev/null || true
+  NS3_PID=""
+  return 0
 }
 
 step "Config"
@@ -566,6 +680,9 @@ fi
 if [[ "$CLEAN_RUNTIME" == "1" ]]; then
   time_stage "Clean previous runtime/check/reports outputs" bash -c 'sudo rm -rf "$1/runtime" "$1/check" "$1/reports"; mkdir -p "$2"' _ "$OUTPUT_DIR" "$LOG_DIR"
 fi
+
+time_stage "Prepare isolated network metric outputs" prepare_network_metric_outputs
+time_stage "Initialize experiment manifest" initialize_experiment_outputs
 
 time_stage "Stop stale OpenPLC runtimes from previous runs" stop_plc_runtimes
 
@@ -618,6 +735,8 @@ time_stage "Run persistent closed-loop control" sudo "$PYTHON_BIN" -m src.runtim
   "${SYNC_EXTRA_ARGS[@]}" \
   "${SCADA_EXTRA_ARGS[@]}"
 
+time_stage "Stop ns-3 and flush network metrics" stop_ns3_gracefully
+time_stage "Analyze ns-3 and link network metrics" analyze_network_results
 time_stage "Export runtime raw/json reports" export_results
 if [[ "$RUN_COMPARE" == "1" ]]; then
   time_stage "Compare attack results against baseline" compare_attack_results
@@ -628,6 +747,7 @@ if [[ "$RUN_CHECK" == "1" ]]; then
 fi
 
 timing_record "run_all total" "$RUN_ALL_START_NS" "$(now_ns)" "0"
+time_stage "Analyze platform performance" "$PYTHON_BIN" "$PROJECT_ROOT/scripts/analyze_performance.py" "$OUTPUT_DIR"
 
 step "Finished"
 echo "[RUNTIME] $OUTPUT_DIR/runtime"

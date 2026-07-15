@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from src.io.csv import append_jsonl, append_row, raw_dir
+from src.metrics.attack_metrics import AttackMetricRecorder
 
 
 _STOP = False
@@ -58,8 +59,10 @@ class DosEventWriter:
         self.runtime_dir = runtime_dir
         self.csv_path = runtime_dir / "csv" / "attack_events.csv"
         self.raw_path = raw_dir(runtime_dir) / "attack_events.jsonl"
+        self.metric_recorder = AttackMetricRecorder(runtime_dir)
         self.columns = [
             "timestamp_epoch",
+            "iteration",
             "attack",
             "event",
             "source",
@@ -78,6 +81,7 @@ class DosEventWriter:
         payload = {**{col: "" for col in self.columns}, **row}
         append_row(self.csv_path, payload, fixed_columns=self.columns)
         append_jsonl(self.raw_path, payload)
+        self.metric_recorder.record(payload, default_event="dos_event")
 
 
 def _write_event(
@@ -92,6 +96,7 @@ def _write_event(
     events.write(
         {
             "timestamp_epoch": f"{time.time():.6f}",
+            "iteration": args.iteration,
             "attack": args.attack,
             "event": event,
             "source": args.source,
@@ -165,6 +170,15 @@ def run(args: argparse.Namespace) -> int:
             bytes_sent += sent
             tick_packets += 1
             tick_bytes += sent
+            if packets == 1:
+                _write_event(
+                    events,
+                    args,
+                    "attack_packet_sent",
+                    packets=1,
+                    bytes_sent=sent,
+                    message="first UDP attack packet sent",
+                )
             next_send += interval
 
             now = time.monotonic()
@@ -212,6 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--packet-size", type=int, required=True)
     p.add_argument("--runtime-dir", required=True, type=Path)
     p.add_argument("--start-after-sec", type=float, default=0.0)
+    p.add_argument("--iteration", type=int, default=-1)
     return p
 
 

@@ -24,6 +24,7 @@ from typing import Any
 from src.control.plc_precompile import copy_binary_atomic, resolve_openplc_root
 from src.core.config import load_runtime_config, load_yaml
 from src.io.csv import append_jsonl, append_row, raw_dir
+from src.metrics.attack_metrics import AttackMetricRecorder
 
 
 SUPPORTED_MODES = {"force_actuator", "threshold_shift", "invert_condition"}
@@ -60,8 +61,10 @@ class EventWriter:
         self.runtime_dir = runtime_dir
         self.csv_path = runtime_dir / "csv" / "attack_events.csv"
         self.raw_path = raw_dir(runtime_dir) / "attack_events.jsonl"
+        self.metric_recorder = AttackMetricRecorder(runtime_dir)
         self.columns = [
             "timestamp_epoch",
+            "iteration",
             "attack",
             "event",
             "target",
@@ -74,6 +77,7 @@ class EventWriter:
         payload = {**{col: "" for col in self.columns}, **row}
         append_row(self.csv_path, payload, fixed_columns=self.columns)
         append_jsonl(self.raw_path, payload)
+        self.metric_recorder.record(payload, default_event="openplc_logic_event")
 
 
 def _write_event(events: EventWriter, args: argparse.Namespace, event: str, message: str) -> None:
@@ -83,6 +87,7 @@ def _write_event(events: EventWriter, args: argparse.Namespace, event: str, mess
     events.write(
         {
             "timestamp_epoch": f"{time.time():.6f}",
+            "iteration": args.iteration,
             "attack": args.attack,
             "event": event,
             "target": args.target,
@@ -512,6 +517,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--state-file", required=True, type=Path)
     p.add_argument("--backup-file", required=True, type=Path)
     p.add_argument("--injection-json", required=True)
+    p.add_argument("--iteration", type=int, default=-1)
     p.add_argument("--restore-on-stop", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--action", choices=["start", "restore"], default="start")
     return p

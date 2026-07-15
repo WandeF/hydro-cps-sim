@@ -327,6 +327,47 @@ def export_cycle_timing(runtime_dir: Path, reports_csv_dir: Path) -> Path:
     return out
 
 
+def export_metric_artifacts(runtime_dir: Path, reports_dir: Path) -> dict[str, Path]:
+    """Copy fixed-schema quantitative outputs without reshaping their rows."""
+    outputs: dict[str, Path] = {}
+    reports_csv_dir = reports_dir / "csv"
+    reports_csv_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("events.csv", "communication.csv", "resources.csv", "network.csv"):
+        source = runtime_dir / "csv" / name
+        target = reports_csv_dir / name
+        if target.exists():
+            target.unlink()
+        if not source.exists():
+            continue
+        shutil.copy2(source, target)
+        outputs[Path(name).stem] = target
+
+    for source, relative_target in (
+        (runtime_dir / "manifest.json", Path("manifest.json")),
+        (runtime_dir / "config_resolved.yaml", Path("config_resolved.yaml")),
+        (runtime_dir / "network" / "network-aggregate.json", Path("network") / "network-aggregate.json"),
+        (runtime_dir / "network" / "flow-monitor.xml", Path("network") / "flow-monitor.xml"),
+        (runtime_dir / "network" / "link-metrics.csv", Path("network") / "link-metrics.csv"),
+    ):
+        target = reports_dir / relative_target
+        if target.exists():
+            target.unlink()
+        if not source.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        outputs[f"artifact_{source.stem}"] = target
+
+    writer_stats_source = runtime_dir / "raw" / "metric_writer_stats"
+    writer_stats_target = reports_dir / "metric_writer_stats"
+    if writer_stats_target.exists():
+        shutil.rmtree(writer_stats_target)
+    if writer_stats_source.is_dir():
+        shutil.copytree(writer_stats_source, writer_stats_target)
+        outputs["metric_writer_stats"] = writer_stats_target
+    return outputs
+
+
 def sync_compat_csv(reports_csv_dir: Path, runtime_dir: Path) -> None:
     compat_dir = runtime_dir / "csv"
     compat_dir.mkdir(parents=True, exist_ok=True)
@@ -364,6 +405,7 @@ def export_all(config: Path, runtime_dir: Path | None = None, reports_dir: Path 
     outputs["attack_schedule"] = export_attack_schedule(runtime_dir, reports_csv_dir)
     outputs["scada_timeout_events"] = export_scada_timeout_events(runtime_dir, reports_csv_dir)
     outputs["cycle_timing"] = export_cycle_timing(runtime_dir, reports_csv_dir)
+    outputs.update(export_metric_artifacts(runtime_dir, reports_dir))
     sync_compat_csv(reports_csv_dir, runtime_dir)
     return outputs
 
