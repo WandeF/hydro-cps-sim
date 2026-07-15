@@ -27,6 +27,7 @@ from src.io.csv import append_jsonl, raw_dir
 
 SUPPORTED_MITM_TYPES = {"mitm", "modbus_mitm"}
 SUPPORTED_DOS_TYPES = {"udp_dos", "dos_udp", "udp_cbr_flood"}
+SUPPORTED_OPENPLC_TYPES = {"openplc_logic", "openplc_logic_injection", "plc_logic_injection"}
 
 
 def _scenario_list(cfg: dict[str, Any]) -> list[dict[str, Any]]:
@@ -254,6 +255,14 @@ def _dos_target_endpoint(scenario: dict[str, Any]) -> str:
     endpoint = target.get("endpoint", scenario.get("target_endpoint", ""))
     if not endpoint:
         raise ValueError(f"attack {scenario.get('name')} missing target.endpoint")
+    return str(endpoint)
+
+
+def _openplc_target_endpoint(scenario: dict[str, Any]) -> str:
+    target = scenario.get("target", {}) or {}
+    endpoint = target.get("endpoint", scenario.get("target_endpoint", ""))
+    if not endpoint:
+        raise ValueError(f"OpenPLC logic attack {scenario.get('name')} missing target.endpoint")
     return str(endpoint)
 
 
@@ -514,7 +523,7 @@ def _iter_mitm_targets(cfg: dict[str, Any], rt, runtime_dir: Path):  # type: ign
     scada_ns = _scada_namespace(cfg)
     for scenario in _scenario_list(cfg):
         attack_type = str(scenario.get("type", "")).lower()
-        if attack_type in SUPPORTED_DOS_TYPES:
+        if attack_type in SUPPORTED_DOS_TYPES or attack_type in SUPPORTED_OPENPLC_TYPES:
             continue
         if attack_type not in SUPPORTED_MITM_TYPES:
             print(f"[ATTACK] skip unsupported attack type={attack_type} name={scenario.get('name')}", flush=True)
@@ -612,6 +621,226 @@ def _iter_dos_targets(cfg: dict[str, Any], rt):  # type: ignore[no-untyped-def]
         if attack_type not in SUPPORTED_DOS_TYPES:
             continue
         yield scenario, _dos_spec(cfg, rt, scenario)
+
+
+def _openplc_pid_key(target: str) -> str:
+    return target
+
+
+def _openplc_backup_file(runtime_dir: Path, attack_name: str, target: str) -> Path:
+    return _attack_runtime_dir(runtime_dir) / f"{_safe_key(attack_name, target)}.original.st"
+
+
+def _openplc_spec(cfg: dict[str, Any], rt, scenario: dict[str, Any], runtime_dir: Path) -> dict[str, Any]:  # type: ignore[no-untyped-def]
+    name = str(scenario.get("name"))
+    endpoint = _openplc_target_endpoint(scenario)
+    endpoint_entry = _endpoint_entry(cfg, endpoint)
+    role = str(endpoint_entry.get("role", "")).lower()
+    if role != "plc":
+        raise ValueError(f"OpenPLC logic attack {name} target endpoint must be role=plc, got {role or '<empty>'}")
+
+    target_key = endpoint.upper()
+    if target_key not in rt.plcs:
+        raise ValueError(f"OpenPLC logic attack {name} target is not a PLC in runtime config: {endpoint}")
+
+    target_cfg = scenario.get("target", {}) or {}
+    configured_ns = str(target_cfg.get("namespace") or "")
+    namespace = configured_ns or str(endpoint_entry.get("namespace") or rt.plcs[target_key].namespace)
+    if not namespace:
+        raise ValueError(f"OpenPLC logic attack {name} target endpoint has no namespace: {endpoint}")
+    if namespace != str(endpoint_entry.get("namespace", "")):
+        raise ValueError(
+            f"OpenPLC logic attack {name} namespace mismatch for {endpoint}: "
+            f"target.namespace={namespace} endpoint.namespace={endpoint_entry.get('namespace')}"
+        )
+
+    injection = scenario.get("injection", {}) or {}
+    if not isinstance(injection, dict):
+        raise ValueError(f"OpenPLC logic attack {name} injection must be a mapping")
+    mode = str(injection.get("mode", "")).lower()
+    if mode not in {"force_actuator", "threshold_shift", "invert_condition"}:
+        raise ValueError(f"OpenPLC logic attack {name} unsupported injection.mode={mode!r}")
+
+    restore_on_stop = bool(injection.get("restore_on_stop", True))
+    pid_key = _openplc_pid_key(target_key)
+    return {
+        "name": name,
+        "target": target_key,
+        "pid_key": pid_key,
+        "namespace": namespace,
+        "injection": injection,
+        "restore_on_stop": restore_on_stop,
+        "state_file": _state_file(runtime_dir, name, pid_key),
+        "backup_file": _openplc_backup_file(runtime_dir, name, pid_key),
+    }
+
+
+def _iter_openplc_targets(cfg: dict[str, Any], rt, runtime_dir: Path):  # type: ignore[no-untyped-def]
+    for scenario in _scenario_list(cfg):
+        attack_type = str(scenario.get("type", "")).lower()
+        if attack_type not in SUPPORTED_OPENPLC_TYPES:
+            continue
+        yield scenario, _openplc_spec(cfg, rt, scenario, runtime_dir)
+
+
+def _wait_openplc_state_active(path: Path, proc: subprocess.Popen, timeout: float) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if path.exists():
+            try:
+                state = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                state = {}
+            if isinstance(state, dict) and bool(state.get("active", False)):
+                return
+        if proc.poll() is not None:
+            raise RuntimeError("OpenPLC logic process exited before reporting active state")
+        time.sleep(0.2)
+    raise TimeoutError(f"OpenPLC logic process did not report active state within {timeout:.1f}s")
+
+
+def _run_openplc_restore(
+    *,
+    args: argparse.Namespace,
+    runtime_dir: Path,
+    spec: dict[str, Any],
+) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    cmd = [
+        "ip", "netns", "exec", spec["namespace"],
+        args.python_bin, "-m", "src.attack.openplc_logic",
+        "--config", str(args.config.resolve()),
+        "--attack", spec["name"],
+        "--target", spec["target"],
+        "--namespace", spec["namespace"],
+        "--runtime-dir", str(runtime_dir),
+        "--state-file", str(spec["state_file"]),
+        "--backup-file", str(spec["backup_file"]),
+        "--injection-json", json.dumps(spec["injection"], sort_keys=True),
+        "--action", "restore",
+    ]
+    print("[ATTACK] restore", " ".join(cmd), flush=True)
+    subprocess.run(cmd, cwd=str(project_root), check=True, text=True)
+
+
+def _stop_openplc_logic(
+    *,
+    args: argparse.Namespace,
+    runtime_dir: Path,
+    scenario: dict[str, Any],
+    spec: dict[str, Any],
+    iteration: int | None = None,
+    reason: str = "stop",
+) -> bool:
+    name = spec["name"]
+    pid_key = spec["pid_key"]
+    pid = _running_pid(runtime_dir, name, pid_key)
+    restored = False
+    if pid is not None:
+        if spec.get("restore_on_stop", True):
+            _run_openplc_restore(args=args, runtime_dir=runtime_dir, spec=spec)
+            restored = True
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    elif spec.get("restore_on_stop", True) and Path(spec["state_file"]).exists():
+        state = json.loads(Path(spec["state_file"]).read_text(encoding="utf-8"))
+        if bool(state.get("active", False)):
+            _run_openplc_restore(args=args, runtime_dir=runtime_dir, spec=spec)
+            restored = True
+
+    try:
+        _pid_file(runtime_dir, name, pid_key).unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+    if restored:
+        _write_schedule_event(runtime_dir, {
+            "timestamp_epoch": f"{time.time():.6f}",
+            "iteration": "" if iteration is None else iteration,
+            "action": "openplc_logic_restore",
+            "attack": name,
+            "target": spec["target"],
+            "active_window": _active_window_label(scenario),
+            "proxy_pid": pid or "",
+            "message": reason,
+        })
+    return restored
+
+
+def _start_openplc_logic(
+    *,
+    args: argparse.Namespace,
+    runtime_dir: Path,
+    scenario: dict[str, Any],
+    spec: dict[str, Any],
+    iteration: int | None = None,
+    reason: str = "inside iteration window",
+) -> bool:
+    name = spec["name"]
+    pid_key = spec["pid_key"]
+    running = _running_pid(runtime_dir, name, pid_key)
+    if running is not None:
+        return False
+    state_path = Path(spec["state_file"])
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            state = {}
+        if isinstance(state, dict) and bool(state.get("active", False)) and spec.get("restore_on_stop", True):
+            _run_openplc_restore(args=args, runtime_dir=runtime_dir, spec=spec)
+
+    project_root = Path(__file__).resolve().parents[2]
+    logs_dir = runtime_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / f"attack_{name}_{spec['target']}.log"
+    log = log_path.open("a", encoding="utf-8")
+    cmd = [
+        "ip", "netns", "exec", spec["namespace"],
+        args.python_bin, "-m", "src.attack.openplc_logic",
+        "--config", str(args.config.resolve()),
+        "--attack", name,
+        "--target", spec["target"],
+        "--namespace", spec["namespace"],
+        "--runtime-dir", str(runtime_dir),
+        "--state-file", str(spec["state_file"]),
+        "--backup-file", str(spec["backup_file"]),
+        "--injection-json", json.dumps(spec["injection"], sort_keys=True),
+    ]
+    if spec.get("restore_on_stop", True):
+        cmd.append("--restore-on-stop")
+    else:
+        cmd.append("--no-restore-on-stop")
+    print("[ATTACK] launch", " ".join(cmd), flush=True)
+    proc = subprocess.Popen(cmd, cwd=str(project_root), stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    _pid_file(runtime_dir, name, pid_key).write_text(str(proc.pid), encoding="utf-8")
+    time.sleep(0.2)
+    if proc.poll() is not None:
+        raise RuntimeError(f"OpenPLC logic process exited early name={name} target={spec['target']}; see {log_path}")
+    try:
+        _wait_openplc_state_active(Path(spec["state_file"]), proc, timeout=90.0)
+    except Exception as exc:
+        raise RuntimeError(f"OpenPLC logic injection did not become active name={name} target={spec['target']}; see {log_path}") from exc
+    _write_schedule_event(runtime_dir, {
+        "timestamp_epoch": f"{time.time():.6f}",
+        "iteration": "" if iteration is None else iteration,
+        "action": "openplc_logic_start",
+        "attack": name,
+        "target": spec["target"],
+        "active_window": _active_window_label(scenario),
+        "proxy_pid": proc.pid,
+        "message": f"namespace={spec['namespace']} mode={spec['injection'].get('mode')} {reason}",
+    })
+    return True
 
 
 def _stop_dos(
@@ -728,6 +957,9 @@ def stop(args: argparse.Namespace) -> int:
     for scenario, spec in _iter_dos_targets(cfg, rt):
         if _stop_dos(runtime_dir=runtime_dir, scenario=scenario, spec=spec, reason="stop all"):
             count += 1
+    for scenario, spec in _iter_openplc_targets(cfg, rt, runtime_dir):
+        if _stop_openplc_logic(args=args, runtime_dir=runtime_dir, scenario=scenario, spec=spec, reason="stop all"):
+            count += 1
     print(f"[ATTACK] stopped configured attack components count={count}", flush=True)
     return 0
 
@@ -752,6 +984,18 @@ def start(args: argparse.Namespace) -> int:
         if attack_type in SUPPORTED_DOS_TYPES:
             spec = _dos_spec(cfg, rt, scenario)
             if _start_dos(
+                args=args,
+                runtime_dir=runtime_dir,
+                scenario=scenario,
+                spec=spec,
+                iteration=args.iteration,
+                reason="manual start",
+            ):
+                launched += 1
+            continue
+        if attack_type in SUPPORTED_OPENPLC_TYPES:
+            spec = _openplc_spec(cfg, rt, scenario, runtime_dir)
+            if _start_openplc_logic(
                 args=args,
                 runtime_dir=runtime_dir,
                 scenario=scenario,
@@ -821,6 +1065,31 @@ def sync(args: argparse.Namespace) -> int:
                     started += 1
             else:
                 if _stop_dos(
+                    runtime_dir=runtime_dir,
+                    scenario=scenario,
+                    spec=spec,
+                    iteration=args.iteration,
+                    reason="iteration window ended",
+                ):
+                    stopped += 1
+            continue
+        if attack_type in SUPPORTED_OPENPLC_TYPES:
+            spec = _openplc_spec(cfg, rt, scenario, runtime_dir)
+            checked += 1
+            active = _active_at_iteration(scenario, args.iteration, default_active=False)
+            if active:
+                if _start_openplc_logic(
+                    args=args,
+                    runtime_dir=runtime_dir,
+                    scenario=scenario,
+                    spec=spec,
+                    iteration=args.iteration,
+                    reason="inside iteration window",
+                ):
+                    started += 1
+            else:
+                if _stop_openplc_logic(
+                    args=args,
                     runtime_dir=runtime_dir,
                     scenario=scenario,
                     spec=spec,

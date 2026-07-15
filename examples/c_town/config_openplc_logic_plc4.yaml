@@ -1,0 +1,814 @@
+actuators:
+- initial_state: closed
+  name: PU1
+- initial_state: open
+  name: PU2
+- initial_state: closed
+  name: PU4
+- initial_state: closed
+  name: PU5
+- initial_state: closed
+  name: PU6
+- initial_state: closed
+  name: PU7
+- initial_state: closed
+  name: PU8
+- initial_state: closed
+  name: PU9
+- initial_state: closed
+  name: PU10
+- initial_state: closed
+  name: PU11
+- initial_state: closed
+  name: V2
+initial_tank_values:
+  T1: '3'
+  T2: '.5'
+  T3: '3'
+  T4: '2.5'
+  T5: '1.0'
+  T6: '5.2'
+  T7: '2.5'
+root_path: /home/lzh/MASTER/CODE
+inp_file: /home/lzh/MASTER/CODE/hydro-cps-sim/examples/c_town/ctown_map.inp
+output_path: /home/lzh/MASTER/CODE/hydro-cps-sim/examples/c_town/output
+openplc_path: /home/lzh/MASTER/CODE/OpenPLC_v3
+ns3_path: /home/lzh/MASTER/CODE/ns-3-dev-git
+iterations: 100
+log_level: debug
+noise_scale: 0.0
+physics:
+  inp_controls: strip
+  step_order: next-run
+  init_flag: 0
+plcs:
+- name: PLC1
+  sensors:
+  - PU1F
+  - PU2F
+  - J280
+  - J269
+  actuators:
+  - PU1
+  - PU2
+  controls:
+  - action: open
+    actuator: PU1
+    dependant: T1
+    type: below
+    value: 4.0
+  - action: closed
+    actuator: PU1
+    dependant: T1
+    type: above
+    value: 6.3
+  - action: open
+    actuator: PU2
+    dependant: T1
+    type: below
+    value: 1.0
+  - action: closed
+    actuator: PU2
+    dependant: T1
+    type: above
+    value: 4.5
+- name: PLC2
+  sensors:
+  - T1
+  actuators:
+  - V2
+  - PU4
+  - PU5
+  - PU6
+  - PU7
+  controls:
+  - action: open
+    actuator: V2
+    dependant: T2
+    type: below
+    value: 0.5
+  - action: closed
+    actuator: V2
+    dependant: T2
+    type: above
+    value: 5.5
+  - action: open
+    actuator: PU4
+    dependant: T3
+    type: below
+    value: 3.0
+  - action: closed
+    actuator: PU4
+    dependant: T3
+    type: above
+    value: 5.3
+  - action: open
+    actuator: PU5
+    dependant: T3
+    type: below
+    value: 1.0
+  - action: closed
+    actuator: PU5
+    dependant: T3
+    type: above
+    value: 3.5
+  - action: open
+    actuator: PU6
+    dependant: T4
+    type: below
+    value: 2.0
+  - action: closed
+    actuator: PU6
+    dependant: T4
+    type: above
+    value: 3.5
+  - action: open
+    actuator: PU7
+    dependant: T4
+    type: below
+    value: 3.0
+  - action: closed
+    actuator: PU7
+    dependant: T4
+    type: above
+    value: 4.5
+- name: PLC3
+  sensors:
+  - T2
+  - V2F
+  - J300
+  - J256
+  - J289
+  - J415
+  - J14
+  - J422
+  - PU4F
+  - PU5F
+  - PU6F
+  - PU7F
+  actuators: []
+  controls: []
+- name: PLC4
+  sensors:
+  - T3
+  - T4
+  actuators:
+  - PU8
+  - PU10
+  - PU11
+  controls:
+  - action: open
+    actuator: PU8
+    dependant: T5
+    type: below
+    value: 1.5
+  - action: closed
+    actuator: PU8
+    dependant: T5
+    type: above
+    value: 4.0
+  - action: open
+    actuator: PU10
+    dependant: T7
+    type: below
+    value: 1.5
+  - action: closed
+    actuator: PU10
+    dependant: T7
+    type: above
+    value: 4.8
+  - action: open
+    actuator: PU11
+    dependant: T7
+    type: below
+    value: 0.5
+  - action: closed
+    actuator: PU11
+    dependant: T7
+    type: above
+    value: 3.0
+- name: PLC5
+  sensors:
+  - PU8F
+  - PU10F
+  - PU11F
+  - J302
+  - J306
+  - J307
+  - J317
+  actuators: []
+  controls: []
+- name: PLC7
+  sensors:
+  - T5
+  actuators: []
+  controls: []
+- name: PLC8
+  sensors:
+  - T6
+  actuators: []
+  controls: []
+- name: PLC9
+  sensors:
+  - T7
+  actuators: []
+  controls: []
+scada:
+  name: scada
+start_time: 2026-03-11 23:42:14.847182
+time:
+- duration:
+  - EN_DURATION
+  - 86400
+- hydraulic_timestep:
+  - EN_HYDSTEP
+  - 300
+network_topology_type: complex
+network:
+  backend: ns3
+  topology_name: star_topo
+  scheduler: realtime
+  routing: global
+  pcap: true
+  ascii_trace: false
+  nodes:
+    routers:
+    - name: r0
+      role: core_router
+    - name: r_scada
+      role: edge_router
+    - name: r1
+      role: edge_router
+    - name: r2
+      role: edge_router
+    - name: r3
+      role: edge_router
+    - name: r4
+      role: edge_router
+    - name: r5
+      role: edge_router
+    - name: r7
+      role: edge_router
+    - name: r8
+      role: edge_router
+    - name: r9
+      role: edge_router
+    switches:
+    - name: s_scada
+      role: bridge_switch
+    - name: s1
+      role: bridge_switch
+    - name: s2
+      role: bridge_switch
+    - name: s3
+      role: bridge_switch
+    - name: s4
+      role: bridge_switch
+    - name: s5
+      role: bridge_switch
+    - name: s7
+      role: bridge_switch
+    - name: s8
+      role: bridge_switch
+    - name: s9
+      role: bridge_switch
+    endpoints:
+    - name: PLC1
+      role: plc
+      namespace: ns-plc1
+      tap: tap-plc1
+    - name: PLC2
+      role: plc
+      namespace: ns-plc2
+      tap: tap-plc2
+    - name: PLC3
+      role: plc
+      namespace: ns-plc3
+      tap: tap-plc3
+    - name: PLC4
+      role: plc
+      namespace: ns-plc4
+      tap: tap-plc4
+    - name: PLC5
+      role: plc
+      namespace: ns-plc5
+      tap: tap-plc5
+    - name: PLC7
+      role: plc
+      namespace: ns-plc7
+      tap: tap-plc7
+    - name: PLC8
+      role: plc
+      namespace: ns-plc8
+      tap: tap-plc8
+    - name: PLC9
+      role: plc
+      namespace: ns-plc9
+      tap: tap-plc9
+    - name: scada
+      role: scada
+      namespace: ns-scada
+      tap: tap-scada
+    - name: mitm
+      role: attacker
+      namespace: ns-attacker
+      tap: tap-attacker
+  backbone_links:
+  - name: r0-r_scada
+    type: point_to_point
+    endpoints:
+    - r0
+    - r_scada
+    data_rate: 100Mbps
+    delay: 2ms
+    mtu: 1500
+    subnet: 10.0.255.0/24
+    interfaces:
+      r0:
+        ifname: r0-eth-scada
+        ip: 10.0.255.1/24
+      r_scada:
+        ifname: r_scada-uplink
+        ip: 10.0.255.2/24
+  - name: r0-r1
+    type: point_to_point
+    endpoints:
+    - r0
+    - r1
+    data_rate: 100Mbps
+    delay: 2ms
+    mtu: 1500
+    subnet: 10.0.1.0/24
+    interfaces:
+      r0:
+        ifname: r0-eth1
+        ip: 10.0.1.1/24
+      r1:
+        ifname: r1-uplink
+        ip: 10.0.1.2/24
+  - name: r0-r2
+    type: point_to_point
+    endpoints:
+    - r0
+    - r2
+    data_rate: 100Mbps
+    delay: 2ms
+    mtu: 1500
+    subnet: 10.0.2.0/24
+    interfaces:
+      r0:
+        ifname: r0-eth2
+        ip: 10.0.2.1/24
+      r2:
+        ifname: r2-uplink
+        ip: 10.0.2.2/24
+  - name: r0-r3
+    type: point_to_point
+    endpoints:
+    - r0
+    - r3
+    data_rate: 100Mbps
+    delay: 2ms
+    mtu: 1500
+    subnet: 10.0.3.0/24
+    interfaces:
+      r0:
+        ifname: r0-eth3
+        ip: 10.0.3.1/24
+      r3:
+        ifname: r3-uplink
+        ip: 10.0.3.2/24
+  - name: r0-r4
+    type: point_to_point
+    endpoints:
+    - r0
+    - r4
+    data_rate: 100Mbps
+    delay: 2ms
+    mtu: 1500
+    subnet: 10.0.4.0/24
+    interfaces:
+      r0:
+        ifname: r0-eth4
+        ip: 10.0.4.1/24
+      r4:
+        ifname: r4-uplink
+        ip: 10.0.4.2/24
+  - name: r0-r5
+    type: point_to_point
+    endpoints:
+    - r0
+    - r5
+    data_rate: 100Mbps
+    delay: 2ms
+    mtu: 1500
+    subnet: 10.0.5.0/24
+    interfaces:
+      r0:
+        ifname: r0-eth5
+        ip: 10.0.5.1/24
+      r5:
+        ifname: r5-uplink
+        ip: 10.0.5.2/24
+  - name: r0-r7
+    type: point_to_point
+    endpoints:
+    - r0
+    - r7
+    data_rate: 100Mbps
+    delay: 2ms
+    mtu: 1500
+    subnet: 10.0.7.0/24
+    interfaces:
+      r0:
+        ifname: r0-eth7
+        ip: 10.0.7.1/24
+      r7:
+        ifname: r7-uplink
+        ip: 10.0.7.2/24
+  - name: r0-r8
+    type: point_to_point
+    endpoints:
+    - r0
+    - r8
+    data_rate: 100Mbps
+    delay: 2ms
+    mtu: 1500
+    subnet: 10.0.8.0/24
+    interfaces:
+      r0:
+        ifname: r0-eth8
+        ip: 10.0.8.1/24
+      r8:
+        ifname: r8-uplink
+        ip: 10.0.8.2/24
+  - name: r0-r9
+    type: point_to_point
+    endpoints:
+    - r0
+    - r9
+    data_rate: 100Mbps
+    delay: 2ms
+    mtu: 1500
+    subnet: 10.0.9.0/24
+    interfaces:
+      r0:
+        ifname: r0-eth9
+        ip: 10.0.9.1/24
+      r9:
+        ifname: r9-uplink
+        ip: 10.0.9.2/24
+  lans:
+  - name: scada_lan
+    type: csma
+    members:
+    - r_scada
+    - s_scada
+    - scada
+    data_rate: 100Mbps
+    delay: 100us
+    mtu: 1500
+    subnet: 192.168.255.0/24
+    interfaces:
+      r_scada:
+        ifname: r_scada-lan0
+        ip: 192.168.255.254/24
+      scada:
+        ifname: scada-eth0
+        ip: 192.168.255.1/24
+        gateway: 192.168.255.254
+  - name: plc1_lan
+    type: csma
+    members:
+    - r1
+    - s1
+    - PLC1
+    data_rate: 100Mbps
+    delay: 100us
+    mtu: 1500
+    subnet: 192.168.1.0/24
+    interfaces:
+      r1:
+        ifname: r1-lan0
+        ip: 192.168.1.254/24
+      PLC1:
+        ifname: PLC1-eth0
+        ip: 192.168.1.1/24
+        gateway: 192.168.1.254
+  - name: plc2_lan
+    type: csma
+    members:
+    - r2
+    - s2
+    - PLC2
+    data_rate: 100Mbps
+    delay: 100us
+    mtu: 1500
+    subnet: 192.168.2.0/24
+    interfaces:
+      r2:
+        ifname: r2-lan0
+        ip: 192.168.2.254/24
+      PLC2:
+        ifname: PLC2-eth0
+        ip: 192.168.2.1/24
+        gateway: 192.168.2.254
+  - name: plc3_lan
+    type: csma
+    members:
+    - r3
+    - s3
+    - PLC3
+    data_rate: 100Mbps
+    delay: 100us
+    mtu: 1500
+    subnet: 192.168.3.0/24
+    interfaces:
+      r3:
+        ifname: r3-lan0
+        ip: 192.168.3.254/24
+      PLC3:
+        ifname: PLC3-eth0
+        ip: 192.168.3.1/24
+        gateway: 192.168.3.254
+  - name: plc4_lan
+    type: csma
+    members:
+    - r4
+    - s4
+    - PLC4
+    - mitm
+    data_rate: 100Mbps
+    delay: 100us
+    mtu: 1500
+    subnet: 192.168.4.0/24
+    interfaces:
+      r4:
+        ifname: r4-lan0
+        ip: 192.168.4.254/24
+      PLC4:
+        ifname: PLC4-eth0
+        ip: 192.168.4.1/24
+        gateway: 192.168.4.254
+      mitm:
+        ifname: attacker-eth0
+        ip: 192.168.4.100/24
+        gateway: 192.168.4.254
+  - name: plc5_lan
+    type: csma
+    members:
+    - r5
+    - s5
+    - PLC5
+    data_rate: 100Mbps
+    delay: 100us
+    mtu: 1500
+    subnet: 192.168.5.0/24
+    interfaces:
+      r5:
+        ifname: r5-lan0
+        ip: 192.168.5.254/24
+      PLC5:
+        ifname: PLC5-eth0
+        ip: 192.168.5.1/24
+        gateway: 192.168.5.254
+  - name: plc7_lan
+    type: csma
+    members:
+    - r7
+    - s7
+    - PLC7
+    data_rate: 100Mbps
+    delay: 100us
+    mtu: 1500
+    subnet: 192.168.7.0/24
+    interfaces:
+      r7:
+        ifname: r7-lan0
+        ip: 192.168.7.254/24
+      PLC7:
+        ifname: PLC7-eth0
+        ip: 192.168.7.1/24
+        gateway: 192.168.7.254
+  - name: plc8_lan
+    type: csma
+    members:
+    - r8
+    - s8
+    - PLC8
+    data_rate: 100Mbps
+    delay: 100us
+    mtu: 1500
+    subnet: 192.168.8.0/24
+    interfaces:
+      r8:
+        ifname: r8-lan0
+        ip: 192.168.8.254/24
+      PLC8:
+        ifname: PLC8-eth0
+        ip: 192.168.8.1/24
+        gateway: 192.168.8.254
+  - name: plc9_lan
+    type: csma
+    members:
+    - r9
+    - s9
+    - PLC9
+    data_rate: 100Mbps
+    delay: 100us
+    mtu: 1500
+    subnet: 192.168.9.0/24
+    interfaces:
+      r9:
+        ifname: r9-lan0
+        ip: 192.168.9.254/24
+      PLC9:
+        ifname: PLC9-eth0
+        ip: 192.168.9.1/24
+        gateway: 192.168.9.254
+  taps:
+  - endpoint: scada
+    tap_name: tap-scada
+    mode: use_bridge
+    host_namespace: ns-scada
+  - endpoint: PLC1
+    tap_name: tap-plc1
+    mode: use_bridge
+    host_namespace: ns-plc1
+  - endpoint: PLC2
+    tap_name: tap-plc2
+    mode: use_bridge
+    host_namespace: ns-plc2
+  - endpoint: PLC3
+    tap_name: tap-plc3
+    mode: use_bridge
+    host_namespace: ns-plc3
+  - endpoint: PLC4
+    tap_name: tap-plc4
+    mode: use_bridge
+    host_namespace: ns-plc4
+  - endpoint: PLC5
+    tap_name: tap-plc5
+    mode: use_bridge
+    host_namespace: ns-plc5
+  - endpoint: PLC7
+    tap_name: tap-plc7
+    mode: use_bridge
+    host_namespace: ns-plc7
+  - endpoint: PLC8
+    tap_name: tap-plc8
+    mode: use_bridge
+    host_namespace: ns-plc8
+  - endpoint: PLC9
+    tap_name: tap-plc9
+    mode: use_bridge
+    host_namespace: ns-plc9
+  - endpoint: mitm
+    tap_name: tap-attacker
+    mode: use_bridge
+    host_namespace: ns-attacker
+  applications:
+  - name: scada_to_plc1
+    src: scada
+    dst: PLC1
+    protocol: tcp
+    dst_port: 502
+  - name: scada_to_plc2
+    src: scada
+    dst: PLC2
+    protocol: tcp
+    dst_port: 502
+  - name: scada_to_plc3
+    src: scada
+    dst: PLC3
+    protocol: tcp
+    dst_port: 502
+  - name: scada_to_plc4
+    src: scada
+    dst: PLC4
+    protocol: tcp
+    dst_port: 502
+  - name: scada_to_mitm_for_plc4
+    src: scada
+    dst: mitm
+    protocol: tcp
+    dst_port: 15030
+  - name: scada_to_plc5
+    src: scada
+    dst: PLC5
+    protocol: tcp
+    dst_port: 502
+  - name: scada_to_plc7
+    src: scada
+    dst: PLC7
+    protocol: tcp
+    dst_port: 502
+  - name: scada_to_plc8
+    src: scada
+    dst: PLC8
+    protocol: tcp
+    dst_port: 502
+  - name: scada_to_plc9
+    src: scada
+    dst: PLC9
+    protocol: tcp
+    dst_port: 502
+  attack_points:
+  - name: core_backbone
+    type: link
+    targets:
+    - r0-r_scada
+    - r0-r1
+    - r0-r2
+    - r0-r3
+    - r0-r4
+    - r0-r5
+    - r0-r7
+    - r0-r8
+    - r0-r9
+  - name: scada_path
+    type: path
+    targets:
+    - scada
+    - s_scada
+    - r_scada
+    - r0
+  - name: plc1_path
+    type: path
+    targets:
+    - PLC1
+    - s1
+    - r1
+    - r0
+  - name: plc2_path
+    type: path
+    targets:
+    - PLC2
+    - s2
+    - r2
+    - r0
+  - name: plc3_path
+    type: path
+    targets:
+    - PLC3
+    - s3
+    - r3
+    - r0
+  - name: plc4_path
+    type: path
+    targets:
+    - PLC4
+    - mitm
+    - s4
+    - r4
+    - r0
+  - name: plc5_path
+    type: path
+    targets:
+    - PLC5
+    - s5
+    - r5
+    - r0
+  - name: plc7_path
+    type: path
+    targets:
+    - PLC7
+    - s7
+    - r7
+    - r0
+  - name: plc8_path
+    type: path
+    targets:
+    - PLC8
+    - s8
+    - r8
+    - r0
+  - name: plc9_path
+    type: path
+    targets:
+    - PLC9
+    - s9
+    - r9
+    - r0
+attacks:
+  enabled: true
+  scenarios:
+  - name: openplc_shift_t7_threshold
+    enabled: true
+    type: openplc_logic_injection
+    trigger:
+      type: iteration_window
+      start_iteration: 20
+      end_iteration: 90
+    target:
+      endpoint: PLC4
+      namespace: ns-plc4
+    injection:
+      mode: threshold_shift
+      rule:
+        actuator: PU10
+        dependant: T7
+        type: above
+        original_value: 4.8
+        injected_value: 999.0
+      restore_on_stop: true

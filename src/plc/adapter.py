@@ -481,8 +481,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_daemon.add_argument("--helics-time-delta", type=float, default=0.001)
     p_daemon.add_argument("--helics-prefix", default="hydro")
     p_daemon.add_argument("--helics-log-level", type=int, default=1)
-    p_daemon.add_argument("--connect-retries", type=int, default=10)
-    p_daemon.add_argument("--connect-retry-delay", type=float, default=0.2)
+    p_daemon.add_argument("--connect-retries", type=int, default=60)
+    p_daemon.add_argument("--connect-retry-delay", type=float, default=0.25)
     p_daemon.add_argument("--keep-running-on-error", action="store_true")
     p_daemon.set_defaults(func=daemon)
 
