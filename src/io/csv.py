@@ -16,8 +16,10 @@ Performance note:
 from __future__ import annotations
 
 import csv
+import fcntl
 import json
 import math
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +48,19 @@ def check_dir(output_dir: Path) -> Path:
     return path
 
 
+@contextmanager
+def _file_lock(path: Path):
+    """Serialize a telemetry file's read/modify/write cycle across processes."""
+    lock_path = path.with_name(f".{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def _json_default(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -57,9 +72,10 @@ def _json_default(value: Any) -> Any:
 def append_jsonl(path: Path, row: dict[str, Any]) -> None:
     """Append one structured runtime record as JSON Lines."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=_json_default))
-        f.write("\n")
+    with _file_lock(path):
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=_json_default))
+            f.write("\n")
 
 
 def _to_cell(value: Any) -> str | int | float | bool | None:
@@ -132,7 +148,12 @@ def append_row(path: Path, row: dict[str, Any], *, fixed_columns: list[str] | No
     path.parent.mkdir(parents=True, exist_ok=True)
     clean_row = {str(k): _to_cell(v) for k, v in row.items()}
 
-    fixed_columns = fixed_columns or []
+    with _file_lock(path):
+        _append_row_locked(path, clean_row, fixed_columns=fixed_columns or [])
+
+
+def _append_row_locked(path: Path, clean_row: dict[str, Any], *, fixed_columns: list[str]) -> None:
+    """Implement append_row while the per-file inter-process lock is held."""
     existing_header = _read_header_only(path)
 
     header: list[str] = []

@@ -228,6 +228,12 @@ time:
   - EN_HYDSTEP
   - 300
 network_topology_type: complex
+metrics:
+  enabled: true
+  event_log: true
+  communication: true
+  resource_monitor: true
+  sample_interval_sec: 0.5
 network:
   backend: ns3
   topology_name: star_topo
@@ -235,6 +241,12 @@ network:
   routing: global
   pcap: true
   ascii_trace: false
+  measurement:
+    enabled: true
+    flow_monitor: true
+    link_metrics: true
+    pcap: true
+    snapshot_interval_sec: 1.0
   nodes:
     routers:
     - name: r0

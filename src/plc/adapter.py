@@ -20,6 +20,7 @@ from typing import Any
 from src.io.csv import append_row, csv_dir, json_dir
 from src.comm.modbus import ModbusEndpoint
 from src.core.config import RuntimeConfig, PlcRuntime, load_runtime_config, read_json, write_json
+from src.metrics import EventLogger, make_event, safe_log, safe_log_many
 from src.sync.filesystem import DEFAULT_POLL_INTERVAL, marker_path, stop_requested, touch_marker, wait_for_marker
 from src.sync.helics_sync import HelicsSync, coordinator_endpoint, plc_endpoint, scada_endpoint
 
@@ -288,6 +289,15 @@ def daemon(args: argparse.Namespace) -> int:
     runtime_dir.mkdir(parents=True, exist_ok=True)
     out_json_dir = json_dir(runtime_dir)
     sync_dir.mkdir(parents=True, exist_ok=True)
+    metrics_cfg = rt.raw.get("metrics", {}) or {}
+    metrics_enabled = isinstance(metrics_cfg, dict) and bool(metrics_cfg.get("enabled", False))
+    event_logger: EventLogger | None = None
+    if metrics_enabled and bool(metrics_cfg.get("event_log", True)):
+        try:
+            event_logger = EventLogger(csv_dir(runtime_dir) / "events.csv")
+        except Exception as exc:
+            event_logger = None
+            print(f"[METRICS][WARN] {plc.name} event metrics disabled: {exc}", flush=True)
 
     lower = plc.lower_name
     max_iterations = args.max_iterations
@@ -306,6 +316,10 @@ def daemon(args: argparse.Namespace) -> int:
         print(f"[PLC-ADAPTER-DAEMON] HELICS endpoint={sync.endpoint}", flush=True)
 
     mb: ModbusEndpoint | None = None
+    previous_outputs: dict[str, bool] = {
+        var.tag: bool(rt.actuator_initial_state.get(var.tag, False))
+        for var in plc.coil_vars.values()
+    }
     iteration = args.start_iteration
     while not _STOP and not stop_requested(sync_dir):
         if end_iteration is not None and iteration >= end_iteration:
@@ -319,6 +333,15 @@ def daemon(args: argparse.Namespace) -> int:
                 "namespace": plc.namespace,
                 "ip": plc.ip,
             }
+            if event_logger is not None:
+                safe_log(event_logger, make_event(
+                    iteration=iteration,
+                    layer="control",
+                    component=plc.name,
+                    event_type="plc_scan_start",
+                    source=plc.name,
+                    status="started",
+                ))
 
             physics_marker = marker_path(sync_dir, "physics", iteration)
             wait_t0 = time.monotonic()
@@ -341,6 +364,25 @@ def daemon(args: argparse.Namespace) -> int:
                 mb = _connect_local(args)
                 local_payload = _write_sensors_with_client(plc, mb, values, args.scope)
             timing["write_sensors_sec"] = time.monotonic() - write_sensor_t0
+            if event_logger is not None:
+                safe_log_many(event_logger, [
+                    make_event(
+                        iteration=iteration,
+                        layer="control",
+                        component=plc.name,
+                        event_type="plc_input_received",
+                        source="physics",
+                        target=plc.name,
+                        variable=(plc.md_vars[name].tag if name in plc.md_vars else name),
+                        value=value,
+                        status="written",
+                        details={
+                            "st_variable": name,
+                            "md_index": plc.md_vars[name].md_index if name in plc.md_vars else "",
+                        },
+                    )
+                    for name, value in sorted((local_payload.get("written", {}) or {}).items())
+                ])
 
             local_output_t0 = time.monotonic()
             local_path = out_json_dir / f"local_write_{iteration:04d}_{lower}.json"
@@ -376,6 +418,29 @@ def daemon(args: argparse.Namespace) -> int:
                 mb = _connect_local(args)
                 actuator_payload = _read_actuators_with_client(plc, mb)
             timing["read_actuators_sec"] = time.monotonic() - read_actuator_t0
+            if event_logger is not None:
+                changed_events = []
+                current_outputs = {
+                    str(name): bool(value)
+                    for name, value in (actuator_payload.get("tags", {}) or {}).items()
+                }
+                for name, value in sorted(current_outputs.items()):
+                    if name in previous_outputs and previous_outputs[name] == value:
+                        continue
+                    changed_events.append(make_event(
+                        iteration=iteration,
+                        layer="control",
+                        component=plc.name,
+                        event_type="plc_output_changed",
+                        source=plc.name,
+                        target="coordinator",
+                        variable=name,
+                        value=value,
+                        status="changed",
+                        details={"previous": previous_outputs.get(name, "")},
+                    ))
+                safe_log_many(event_logger, changed_events)
+                previous_outputs = current_outputs
 
             actuator_output_t0 = time.monotonic()
             actuator_path = out_json_dir / f"actuators_{iteration:04d}_{lower}.json"
@@ -401,6 +466,20 @@ def daemon(args: argparse.Namespace) -> int:
             timing["actuator_count"] = len(actuator_payload.get("actuators", {}) or {})
             timing["cycle_total_sec"] = time.monotonic() - cycle_t0
             _write_plc_adapter_timing_csv(runtime_dir, timing)
+            if event_logger is not None:
+                safe_log(event_logger, make_event(
+                    iteration=iteration,
+                    layer="control",
+                    component=plc.name,
+                    event_type="plc_scan_end",
+                    source=plc.name,
+                    status="success",
+                    details={
+                        "cycle_total_sec": timing["cycle_total_sec"],
+                        "sensor_written_count": timing["sensor_written_count"],
+                        "actuator_count": timing["actuator_count"],
+                    },
+                ))
             print(
                 f"[PLC-ADAPTER-DAEMON] {plc.name} cycle={iteration} actuators read={len(actuator_payload['actuators'])} "
                 f"timing wait_physics={timing['wait_physics_marker_sec']:.4f}s "
@@ -412,6 +491,16 @@ def daemon(args: argparse.Namespace) -> int:
             )
             iteration += 1
         except Exception as exc:
+            if event_logger is not None:
+                safe_log(event_logger, make_event(
+                    iteration=iteration,
+                    layer="control",
+                    component=plc.name,
+                    event_type="plc_scan_error",
+                    source=plc.name,
+                    status="error",
+                    details={"error": str(exc), "type": type(exc).__name__},
+                ))
             err_path = out_json_dir / f"error_{iteration:04d}_{lower}.json"
             write_json(err_path, {"plc": plc.name, "iteration": iteration, "error": str(exc), "traceback": traceback.format_exc()})
             error_signal = {"plc": plc.name, "iteration": iteration, "error": str(exc), "output": str(err_path)}

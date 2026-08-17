@@ -11,7 +11,10 @@ SKIP_PREP=0
 SKIP_COMPILE=0
 SKIP_NS3=0
 NS3_START_WAIT="${NS3_START_WAIT:-2}"
+NS3_READY_TIMEOUT="${NS3_READY_TIMEOUT:-180}"
+NS3_DRAIN_SEC="${NS3_DRAIN_SEC:-}"
 POLL_INTERVAL="${POLL_INTERVAL:-0.005}"
+SYNC_TIMEOUT="${SYNC_TIMEOUT:-30.0}"
 SYNC_BACKEND="${SYNC_BACKEND:-filesystem}"
 HELICS_CORE_TYPE="${HELICS_CORE_TYPE:-ipc}"
 HELICS_CORE_INIT="${HELICS_CORE_INIT:-}"
@@ -23,10 +26,14 @@ HELICS_BROKER_NAME="${HELICS_BROKER_NAME:-hydro_cps_broker}"
 HELICS_START_BROKER="${HELICS_START_BROKER:-1}"
 HELICS_BROKER_PID=""
 SCADA_MODBUS_WORKERS="${SCADA_MODBUS_WORKERS:-8}"
+MODBUS_TIMEOUT="${MODBUS_TIMEOUT:-2.0}"
+CONNECT_RETRIES="${CONNECT_RETRIES:-60}"
 NO_BATCH_MODBUS=0
 NO_PERSISTENT_SCADA_CONNECTIONS=0
 CLEAN_RUNTIME="${CLEAN_RUNTIME:-1}"
 NS3_PID=""
+MODBUS_TRACE_PIDS=()
+MODBUS_TRACE_STOP_FILE=""
 SUDO_KEEPALIVE_PID=""
 STOP_PLC_ON_EXIT="${STOP_PLC_ON_EXIT:-1}"
 STOP_ATTACKS_ON_EXIT="${STOP_ATTACKS_ON_EXIT:-1}"
@@ -34,6 +41,9 @@ PRE_CLEAN_STALE_RUNTIME="${PRE_CLEAN_STALE_RUNTIME:-1}"
 CLEAN_STALE_NETWORK_ON_EXIT="${CLEAN_STALE_NETWORK_ON_EXIT:-1}"
 EXPORT_RESULTS_ON_EXIT="${EXPORT_RESULTS_ON_EXIT:-1}"
 EXPORT_RESULTS_DONE=0
+NETWORK_ANALYSIS_DONE=0
+NETWORK_OUTPUTS_PREPARED=0
+RUN_OUTPUTS_INITIALIZED=0
 
 usage() {
   cat <<EOF
@@ -49,6 +59,7 @@ Options:
   --skip-compile      Skip OpenPLC ST compilation
   --skip-ns3          Do not start ns-3; useful for local debugging only
   --poll-interval S   Filesystem marker polling interval. Default: 0.005
+  --sync-timeout S    Marker wait timeout. Default: 30.0
   --sync-backend NAME filesystem or helics. Default: filesystem
   --helics-core-type TYPE
                      HELICS core type. Default: ipc
@@ -68,7 +79,10 @@ Options:
 Environment:
   PYTHON_BIN          Python executable visible from namespaces
   NS3_START_WAIT      Seconds to wait after starting ns-3. Default: 2
+  NS3_READY_TIMEOUT   Maximum seconds to wait for ns-3 build/start readiness. Default: 180
+  NS3_DRAIN_SEC       Network drain period; defaults to experiment.drain_period_sec
   POLL_INTERVAL       Filesystem marker polling interval. Default: 0.005
+  SYNC_TIMEOUT        Marker wait timeout. Default: 30.0
   SYNC_BACKEND        filesystem or helics. Default: filesystem
   HELICS_CORE_TYPE    HELICS core type. Default: ipc
   HELICS_CORE_INIT    HELICS core init string
@@ -77,6 +91,8 @@ Environment:
   HELICS_BROKER_NAME  Broker name when run_all auto-starts helics_broker. Default: hydro_cps_broker
   HELICS_START_BROKER 1 to auto-start helics_broker for --sync-backend helics. Default: 1
   SCADA_MODBUS_WORKERS Concurrent PLC Modbus workers for SCADA. Default: 8
+  MODBUS_TIMEOUT      Per-request Modbus timeout in seconds. Default: 2.0
+  CONNECT_RETRIES     Initial Modbus connection retry limit. Default: 60
   RUN_COMPARE         1 to compare run outputs against baseline. Default: 0
   CLEAN_RUNTIME       1 to delete output/runtime and output/check before run. Default: 1
   STOP_PLC_ON_EXIT    1 to stop PLC runtimes when run_all exits. Default: 1
@@ -105,6 +121,8 @@ while [[ $# -gt 0 ]]; do
       SKIP_NS3=1; shift ;;
     --poll-interval)
       POLL_INTERVAL="$2"; shift 2 ;;
+    --sync-timeout)
+      SYNC_TIMEOUT="$2"; shift 2 ;;
     --sync-backend)
       SYNC_BACKEND="$2"; shift 2 ;;
     --helics-core-type)
@@ -140,6 +158,7 @@ CONFIG="$(realpath "$CONFIG")"
 # Resolve paths from config.yaml once so every later step uses the same source of truth.
 eval "$("$PYTHON_BIN" -m src.run.config_info --config "$CONFIG")"
 ITERATIONS="${ITERATIONS:-$ITERATIONS_FROM_CONFIG}"
+NS3_DRAIN_SEC="${NS3_DRAIN_SEC:-$DRAIN_PERIOD_FROM_CONFIG}"
 LOG_DIR="$OUTPUT_DIR/logs"
 mkdir -p "$LOG_DIR"
 
@@ -293,9 +312,67 @@ export_results() {
   sudo_maybe "$PYTHON_BIN" "$PROJECT_ROOT/scripts/export_results.py" \
     --config "$CONFIG" \
     --runtime-dir "$OUTPUT_DIR/runtime" \
-    --reports-dir "$OUTPUT_DIR/reports"
+    --reports-dir "$OUTPUT_DIR/reports" || return $?
   sudo_maybe chown -R "$(id -u):$(id -g)" "$OUTPUT_DIR/reports" 2>/dev/null || true
   EXPORT_RESULTS_DONE=1
+}
+
+initialize_experiment_outputs() {
+  sudo_maybe rm -f "$OUTPUT_DIR/runtime/run_started.json" || return $?
+  sudo_maybe "$PYTHON_BIN" "$PROJECT_ROOT/scripts/write_experiment_manifest.py" \
+    --config "$CONFIG" \
+    --runtime-dir "$OUTPUT_DIR/runtime" || return $?
+  RUN_OUTPUTS_INITIALIZED=1
+}
+
+analyze_network_results() {
+  if [[ "${NETWORK_ANALYSIS_DONE:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ "$SKIP_NS3" == "1" ]]; then
+    echo "[NETWORK-METRICS] skipped because ns-3 was not started"
+    NETWORK_ANALYSIS_DONE=1
+    return 0
+  fi
+  if [[ "${NETWORK_OUTPUTS_PREPARED:-0}" != "1" ]]; then
+    echo "[NETWORK-METRICS] skipped because this run did not prepare network outputs"
+    return 0
+  fi
+  "$PYTHON_BIN" "$PROJECT_ROOT/scripts/analyze_network.py" --config "$CONFIG" || return $?
+  NETWORK_ANALYSIS_DONE=1
+}
+
+prepare_network_metric_outputs() {
+  local network_dir="$OUTPUT_DIR/runtime/network"
+  local csv_dir="$OUTPUT_DIR/runtime/csv"
+  local reports_dir="$OUTPUT_DIR/reports"
+  # Network files represent exactly one execution.  Clear them even when the
+  # caller keeps other runtime outputs with CLEAN_RUNTIME=0, so analysis can
+  # never silently consume FlowMonitor/link/PCAP data from an earlier run.
+  sudo_maybe mkdir -p "$network_dir" "$csv_dir" || return $?
+  sudo_maybe rm -f \
+    "$network_dir/flow-monitor.xml" \
+    "$network_dir/link-metrics.csv" \
+    "$network_dir/link-metrics.csv.tmp" \
+    "$network_dir/queue-timeseries.csv" \
+    "$network_dir/modbus-packet-trace.stop" \
+    "$network_dir"/modbus-packet-trace-*.csv \
+    "$network_dir/network-aggregate.json" \
+    "$network_dir/ns3.stop" \
+    "$csv_dir/network.csv" || return $?
+  sudo_maybe rm -rf "$network_dir/pcap" || return $?
+  sudo_maybe rm -rf \
+    "$OUTPUT_DIR/runtime/raw/metric_writer_stats" \
+    "$reports_dir/metric_writer_stats" || return $?
+  sudo_maybe mkdir -p "$network_dir/pcap" || return $?
+  sudo_maybe rm -f \
+    "$reports_dir/csv/network.csv" \
+    "$reports_dir/network/network-aggregate.json" \
+    "$reports_dir/network/flow-monitor.xml" \
+    "$reports_dir/network/link-metrics.csv" || return $?
+  sudo_maybe rm -rf "$reports_dir/metrics" || return $?
+  sudo_maybe chown -R "$(id -u):$(id -g)" "$network_dir" "$csv_dir" 2>/dev/null || true
+  NETWORK_OUTPUTS_PREPARED=1
 }
 
 compare_attack_results() {
@@ -315,11 +392,14 @@ compare_attack_results() {
 cleanup() {
   local rc=$?
   trap - EXIT INT TERM
+  stop_modbus_packet_traces || true
   if [[ -n "${NS3_PID:-}" ]]; then
     echo "[CLEANUP] stopping ns-3 process group $NS3_PID"
     kill -TERM -- "-$NS3_PID" 2>/dev/null || sudo -n kill -TERM -- "-$NS3_PID" 2>/dev/null || sudo kill -TERM -- "-$NS3_PID" 2>/dev/null || true
     sleep 1
     kill -KILL -- "-$NS3_PID" 2>/dev/null || sudo -n kill -KILL -- "-$NS3_PID" 2>/dev/null || sudo kill -KILL -- "-$NS3_PID" 2>/dev/null || true
+    wait "$NS3_PID" 2>/dev/null || true
+    NS3_PID=""
   fi
   if [[ "${STOP_ATTACKS_ON_EXIT:-1}" == "1" ]]; then
     echo "[CLEANUP] stopping configured attack runtime"
@@ -328,7 +408,10 @@ cleanup() {
   if [[ "${STOP_PLC_ON_EXIT:-1}" == "1" ]]; then
     stop_plc_runtimes || true
   fi
-  if [[ "${EXPORT_RESULTS_ON_EXIT:-1}" == "1" ]]; then
+  if [[ "${RUN_OUTPUTS_INITIALIZED:-0}" == "1" && -f "$OUTPUT_DIR/runtime/run_started.json" ]]; then
+    analyze_network_results || true
+  fi
+  if [[ "${EXPORT_RESULTS_ON_EXIT:-1}" == "1" && "${RUN_OUTPUTS_INITIALIZED:-0}" == "1" && -f "$OUTPUT_DIR/runtime/run_started.json" ]]; then
     export_results || true
   fi
   if [[ "${CLEAN_STALE_NETWORK_ON_EXIT:-1}" == "1" ]]; then
@@ -473,6 +556,7 @@ run_ns3() {
   local src_cc="$OUTPUT_DIR/ns3_network.cc"
   local scratch_cc="$NS3_PATH/scratch/ns3_network.cc"
   local log_file="$LOG_DIR/ns3_network.log"
+  local stop_file="$OUTPUT_DIR/runtime/network/ns3.stop"
 
   if [[ ! -f "$src_cc" ]]; then
     echo "[ERROR] ns-3 source not found: $src_cc" >&2
@@ -512,6 +596,8 @@ run_ns3() {
   echo "[NS3] cmd    : cd $NS3_PATH && setsid $ns3_cmd"
 
   : > "$log_file"
+  mkdir -p "$(dirname "$stop_file")"
+  rm -f "$stop_file"
   local pid_file="$LOG_DIR/ns3_network.pid"
   rm -f "$pid_file"
 
@@ -533,14 +619,129 @@ run_ns3() {
     NS3_PID="$launcher_pid"
   fi
 
-  sleep "$NS3_START_WAIT"
-
+  local ready=0
+  local ready_deadline=$((SECONDS + NS3_READY_TIMEOUT))
+  while (( SECONDS < ready_deadline )); do
+    if grep -Fq "ns3 network started." "$log_file" 2>/dev/null; then
+      ready=1
+      break
+    fi
+    if ! kill -0 "$NS3_PID" 2>/dev/null; then
+      echo "[ERROR] ns-3 exited before reporting ready. Tail of log:" >&2
+      tail -n 80 "$log_file" >&2 || true
+      exit 1
+    fi
+    sleep 0.2
+  done
+  if [[ "$ready" != "1" ]]; then
+    echo "[ERROR] ns-3 did not report ready within ${NS3_READY_TIMEOUT}s. Tail of log:" >&2
+    tail -n 80 "$log_file" >&2 || true
+    exit 1
+  fi
+  if [[ "$NS3_START_WAIT" != "0" ]]; then
+    sleep "$NS3_START_WAIT"
+  fi
   if ! kill -0 "$NS3_PID" 2>/dev/null; then
-    echo "[ERROR] ns-3 exited early. Tail of log:" >&2
+    echo "[ERROR] ns-3 exited immediately after reporting ready. Tail of log:" >&2
     tail -n 80 "$log_file" >&2 || true
     exit 1
   fi
   echo "[NS3] started pid=$NS3_PID"
+}
+
+start_modbus_packet_traces() {
+  local network_dir="$OUTPUT_DIR/runtime/network"
+  local specs_file="$network_dir/modbus-packet-trace-specs.tsv"
+  MODBUS_TRACE_STOP_FILE="$network_dir/modbus-packet-trace.stop"
+  rm -f "$MODBUS_TRACE_STOP_FILE" "$specs_file"
+  "$PYTHON_BIN" -m src.metrics.modbus_packet_trace \
+    --config "$CONFIG" --list-specs > "$specs_file"
+  if [[ ! -s "$specs_file" ]]; then
+    echo "[MODBUS-TRACE] disabled by config"
+    return 0
+  fi
+
+  local role namespace local_ip peer_ip plc_id output log_file pid
+  while IFS=$'\t' read -r role namespace local_ip peer_ip plc_id; do
+    [[ -z "$role" ]] && continue
+    output="$network_dir/modbus-packet-trace-${plc_id,,}-${role}.csv"
+    log_file="$LOG_DIR/modbus-packet-trace-${plc_id,,}-${role}.log"
+    rm -f "$output"
+    : > "$log_file"
+    sudo -n ip netns exec "$namespace" "$PYTHON_BIN" \
+      -m src.metrics.modbus_packet_trace \
+      --role "$role" --local-ip "$local_ip" --peer-ip "$peer_ip" \
+      --plc-id "$plc_id" --output "$output" \
+      --stop-file "$MODBUS_TRACE_STOP_FILE" >"$log_file" 2>&1 &
+    pid=$!
+    MODBUS_TRACE_PIDS+=("$pid")
+    echo "[MODBUS-TRACE] role=$role plc=$plc_id namespace=$namespace pid=$pid"
+  done < "$specs_file"
+  sleep 0.3
+  for pid in "${MODBUS_TRACE_PIDS[@]}"; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "[ERROR] Modbus packet tracer exited before the experiment" >&2
+      return 1
+    fi
+  done
+}
+
+stop_modbus_packet_traces() {
+  if [[ "${#MODBUS_TRACE_PIDS[@]}" -eq 0 ]]; then
+    return 0
+  fi
+  if [[ -n "${MODBUS_TRACE_STOP_FILE:-}" ]]; then
+    mkdir -p "$(dirname "$MODBUS_TRACE_STOP_FILE")"
+    touch "$MODBUS_TRACE_STOP_FILE"
+  fi
+  local pid
+  for pid in "${MODBUS_TRACE_PIDS[@]}"; do
+    for _ in $(seq 1 30); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || sudo -n kill -TERM "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+  done
+  MODBUS_TRACE_PIDS=()
+  sudo_maybe chown -R "$(id -u):$(id -g)" "$OUTPUT_DIR/runtime/network" 2>/dev/null || true
+  echo "[MODBUS-TRACE] stopped"
+}
+
+stop_ns3_gracefully() {
+  if [[ -z "$NS3_PID" ]]; then
+    return 0
+  fi
+  local stop_file="$OUTPUT_DIR/runtime/network/ns3.stop"
+  mkdir -p "$(dirname "$stop_file")"
+  touch "$stop_file"
+  echo "[NS3] graceful stop requested: $stop_file"
+  for _ in $(seq 1 100); do
+    if ! kill -0 "$NS3_PID" 2>/dev/null; then
+      wait "$NS3_PID" 2>/dev/null || true
+      echo "[NS3] stopped after flushing network metrics"
+      NS3_PID=""
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "[NS3][WARN] graceful stop timed out; terminating process group pid=$NS3_PID" >&2
+  kill -TERM -- "-$NS3_PID" 2>/dev/null || sudo -n kill -TERM -- "-$NS3_PID" 2>/dev/null || true
+  sleep 0.5
+  kill -KILL -- "-$NS3_PID" 2>/dev/null || sudo -n kill -KILL -- "-$NS3_PID" 2>/dev/null || true
+  wait "$NS3_PID" 2>/dev/null || true
+  NS3_PID=""
+  return 0
+}
+
+drain_network() {
+  "$PYTHON_BIN" -c 'import sys; value=float(sys.argv[1]); assert value >= 0' "$NS3_DRAIN_SEC"
+  if [[ "$NS3_DRAIN_SEC" != "0" && "$NS3_DRAIN_SEC" != "0.0" ]]; then
+    echo "[NS3] draining in-flight packets for ${NS3_DRAIN_SEC}s"
+    sleep "$NS3_DRAIN_SEC"
+  fi
 }
 
 step "Config"
@@ -567,6 +768,9 @@ if [[ "$CLEAN_RUNTIME" == "1" ]]; then
   time_stage "Clean previous runtime/check/reports outputs" bash -c 'sudo rm -rf "$1/runtime" "$1/check" "$1/reports"; mkdir -p "$2"' _ "$OUTPUT_DIR" "$LOG_DIR"
 fi
 
+time_stage "Prepare isolated network metric outputs" prepare_network_metric_outputs
+time_stage "Initialize experiment manifest" initialize_experiment_outputs
+
 time_stage "Stop stale OpenPLC runtimes from previous runs" stop_plc_runtimes
 
 if [[ "$SKIP_PREP" != "1" ]]; then
@@ -588,6 +792,7 @@ fi
 time_stage "Create Linux namespaces, bridges, veth pairs, and TAP devices" bash "$OUTPUT_DIR/network.sh"
 time_stage "Launch OpenPLC runtimes and start Modbus/TCP" "$PYTHON_BIN" -m src.control.plc_run --config "$CONFIG"
 time_stage "Start ns-3 network" run_ns3
+time_stage "Start optional Modbus packet-boundary traces" start_modbus_packet_traces
 time_stage "Start HELICS broker if requested" start_helics_broker
 time_stage "Stop stale configured attack runtime/rules" stop_stale_attacks
 SCADA_EXTRA_ARGS=(--scada-modbus-workers "$SCADA_MODBUS_WORKERS")
@@ -614,10 +819,17 @@ time_stage "Run persistent closed-loop control" sudo "$PYTHON_BIN" -m src.runtim
   --physics-mode dhalsim_epynet \
   --init-style dhalsim \
   --poll-interval "$POLL_INTERVAL" \
-  --logic-wait 0.3 \
+  --sync-timeout "$SYNC_TIMEOUT" \
+  --timeout "$MODBUS_TIMEOUT" \
+  --connect-retries "$CONNECT_RETRIES" \
+  --logic-wait 0.1 \
   "${SYNC_EXTRA_ARGS[@]}" \
   "${SCADA_EXTRA_ARGS[@]}"
 
+time_stage "Stop Modbus packet-boundary traces" stop_modbus_packet_traces
+time_stage "Drain in-flight network packets" drain_network
+time_stage "Stop ns-3 and flush network metrics" stop_ns3_gracefully
+time_stage "Analyze ns-3 and link network metrics" analyze_network_results
 time_stage "Export runtime raw/json reports" export_results
 if [[ "$RUN_COMPARE" == "1" ]]; then
   time_stage "Compare attack results against baseline" compare_attack_results
@@ -628,6 +840,7 @@ if [[ "$RUN_CHECK" == "1" ]]; then
 fi
 
 timing_record "run_all total" "$RUN_ALL_START_NS" "$(now_ns)" "0"
+time_stage "Analyze platform performance" "$PYTHON_BIN" "$PROJECT_ROOT/scripts/analyze_performance.py" "$OUTPUT_DIR"
 
 step "Finished"
 echo "[RUNTIME] $OUTPUT_DIR/runtime"

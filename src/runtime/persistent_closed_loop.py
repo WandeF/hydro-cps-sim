@@ -21,16 +21,21 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from src.io.csv import append_jsonl, append_row, csv_dir, json_dir, raw_dir
 from src.io.dhalsim import write_physics_row
 from src.physics.engine import PhysicsEngine
 from src.core.config import load_runtime_config, read_json, write_json
+from src.experiment.manifest import write_manifest
+from src.metrics import EventLogger, RuntimeMonitor, make_event, safe_log, safe_log_many
+from src.metrics.writer_quality import analyze_metric_writer_stats, required_metric_writers
 from src.sync.filesystem import DEFAULT_POLL_INTERVAL, clear_ready_files, marker_path, touch_marker
 from src.sync.helics_sync import HelicsSync, coordinator_endpoint, plc_endpoint, scada_endpoint
 
@@ -189,7 +194,14 @@ def _send_helics_stop(sync: HelicsSync | None, rt) -> None:  # type: ignore[no-u
     except Exception as exc:
         print(f"[HELICS][WARN] failed to send stop messages: {exc}")
 
-def stop_daemons(processes: dict[str, subprocess.Popen], log_handles: list[Any], sync_dir: Path, *, grace: float = 3.0) -> None:
+def stop_daemons(
+    processes: dict[str, subprocess.Popen],
+    log_handles: list[Any],
+    sync_dir: Path,
+    *,
+    grace: float = 5.0,
+    terminate_grace: float = 3.5,
+) -> None:
     try:
         touch_marker(marker_path(sync_dir, "stop"), {"reason": "coordinator shutdown"})
     except Exception:
@@ -207,7 +219,15 @@ def stop_daemons(processes: dict[str, subprocess.Popen], log_handles: list[Any],
         if proc.poll() is None:
             print(f"[STOP] terminate {name}")
             proc.terminate()
-    time.sleep(0.5)
+    terminate_deadline = time.monotonic() + max(0.0, terminate_grace)
+    for proc in processes.values():
+        if proc.poll() is not None:
+            continue
+        remaining = max(0.0, terminate_deadline - time.monotonic())
+        try:
+            proc.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            pass
     for name, proc in processes.items():
         if proc.poll() is None:
             print(f"[STOP] kill {name}")
@@ -220,12 +240,141 @@ def stop_daemons(processes: dict[str, subprocess.Popen], log_handles: list[Any],
             pass
 
 
+def _metric_processes(
+    rt,  # type: ignore[no-untyped-def]
+    runtime_dir: Path,
+    processes: Mapping[str, int | subprocess.Popen],
+    transient_roots: Mapping[str, int] | None = None,
+) -> dict[str, int]:
+    """Return explicit, de-duplicated PIDs for resource sampling.
+
+    The coordinator's child tree contains the Python PLC/SCADA daemons, so
+    recursively sampling it as well as named daemons double-counts resources.
+    OpenPLC and ns-3 are launched by ``run_all.sh`` and are not coordinator
+    children; their PID files are therefore included explicitly.
+    """
+
+    monitored: dict[str, int] = {}
+    seen: set[int] = set()
+
+    def add(component: str, raw_pid: Any) -> None:
+        try:
+            pid = int(raw_pid)
+        except (TypeError, ValueError):
+            return
+        if pid <= 0 or pid in seen:
+            return
+        seen.add(pid)
+        monitored[component] = pid
+
+    def add_pid_file(component: str, path: Path) -> int | None:
+        try:
+            pid = int(path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return None
+        add(component, pid)
+        return pid
+
+    add("coordinator", os.getpid())
+    for name, proc in processes.items():
+        add(name, getattr(proc, "pid", proc))
+    for plc in rt.plcs.values():
+        add_pid_file(f"openplc:{plc.name}", rt.output_dir / "run" / f"{plc.lower_name}.pid")
+    ns3_pid = add_pid_file("ns3", rt.output_dir / "logs" / "ns3_network.pid")
+    if ns3_pid is not None:
+        for child_pid in _process_descendants(ns3_pid):
+            add(f"ns3:child:{child_pid}", child_pid)
+    for pid_path in sorted((runtime_dir / "attacks").glob("*.pid")):
+        add_pid_file(f"attack:{pid_path.stem}", pid_path)
+    for component, root_pid in (transient_roots or {}).items():
+        add(component, root_pid)
+        for child_pid in _process_descendants(root_pid):
+            add(f"{component}:child:{child_pid}", child_pid)
+    return monitored
+
+
+def _process_descendants(root_pid: int) -> list[int]:
+    """Read Linux procfs to find launcher descendants without requiring psutil."""
+
+    descendants: list[int] = []
+    pending = [int(root_pid)]
+    seen = {int(root_pid)}
+    while pending:
+        parent = pending.pop()
+        children: set[int] = set()
+        try:
+            task_dirs = list((Path("/proc") / str(parent) / "task").iterdir())
+        except OSError:
+            continue
+        for task_dir in task_dirs:
+            try:
+                raw = (task_dir / "children").read_text(encoding="utf-8")
+            except OSError:
+                continue
+            for token in raw.split():
+                try:
+                    child = int(token)
+                except ValueError:
+                    continue
+                if child > 0:
+                    children.add(child)
+        for child in sorted(children):
+            if child in seen:
+                continue
+            seen.add(child)
+            descendants.append(child)
+            pending.append(child)
+    return descendants
+
+
+class _MetricProcessRegistry:
+    """Thread-safe resolver for only the processes owned by this experiment."""
+
+    def __init__(self, rt, runtime_dir: Path) -> None:  # type: ignore[no-untyped-def]
+        self._rt = rt
+        self._runtime_dir = runtime_dir
+        self._lock = threading.RLock()
+        self._runtime_processes: dict[str, int] = {}
+        self._transient_roots: dict[str, int] = {}
+
+    def set_runtime_processes(self, processes: Mapping[str, int | subprocess.Popen]) -> None:
+        with self._lock:
+            self._runtime_processes = {
+                str(name): int(getattr(proc, "pid", proc))
+                for name, proc in processes.items()
+            }
+
+    def add_transient_root(self, component: str, pid: int) -> None:
+        with self._lock:
+            self._transient_roots[str(component)] = int(pid)
+
+    def remove_transient_root(self, component: str, pid: int) -> None:
+        with self._lock:
+            if self._transient_roots.get(str(component)) == int(pid):
+                self._transient_roots.pop(str(component), None)
+
+    def resolve(self) -> dict[str, int]:
+        with self._lock:
+            runtime_processes = dict(self._runtime_processes)
+            transient_roots = dict(self._transient_roots)
+        return _metric_processes(
+            self._rt,
+            self._runtime_dir,
+            runtime_processes,
+            transient_roots,
+        )
+
+
 def _write_physics_csv(runtime_dir: Path, rt, snapshot: dict[str, Any], *, filename: str = "physics.csv") -> None:  # type: ignore[no-untyped-def]
     """Write simulator state in flat DHALSIM-compatible CSV format."""
     write_physics_row(runtime_dir, rt, snapshot, filename=filename)
 
 
-def _write_actuator_state_csv(runtime_dir: Path, iteration: int, actuator_state: dict[str, bool]) -> None:
+def _write_actuator_state_csv(
+    runtime_dir: Path,
+    iteration: int,
+    actuator_state: dict[str, bool],
+) -> None:
     row: dict[str, Any] = {"iteration": iteration}
     for name, value in sorted(actuator_state.items()):
         row[f"actuator.{name}"] = value
@@ -315,7 +464,14 @@ def _write_timing_summary_csv(runtime_dir: Path, rows: list[dict[str, Any]]) -> 
         )
 
 
-def persist_physics_snapshot(runtime_dir: Path, rt, iteration: int, snapshot: dict[str, Any]) -> Path:  # type: ignore[no-untyped-def]
+def persist_physics_snapshot(
+    runtime_dir: Path,
+    rt,
+    iteration: int,
+    snapshot: dict[str, Any],
+    *,
+    event_logger: EventLogger | None = None,
+) -> Path:  # type: ignore[no-untyped-def]
     """Persist one physics state without releasing the synchronization marker."""
     physics_path = json_dir(runtime_dir) / f"physics_{iteration:04d}.json"
     snapshot = dict(snapshot)
@@ -323,6 +479,35 @@ def persist_physics_snapshot(runtime_dir: Path, rt, iteration: int, snapshot: di
     write_json(physics_path, snapshot)
     append_jsonl(raw_dir(runtime_dir) / "physics.jsonl", snapshot)
     _write_physics_csv(runtime_dir, rt, snapshot)
+    if event_logger is not None:
+        values = snapshot.get("values", {}) or {}
+        events = [make_event(
+            iteration=iteration,
+            layer="physical",
+            component="epanet",
+            event_type="physics_snapshot_persisted",
+            source="epanet",
+            target="coordinator",
+            status="success",
+            details={
+                "backend": snapshot.get("backend", ""),
+                "value_count": len(values),
+                "path": str(physics_path),
+            },
+        )]
+        for name, value in sorted(values.items()):
+            events.append(make_event(
+                iteration=iteration,
+                layer="physical",
+                component="epanet",
+                event_type="physics_sensor_value",
+                source="epanet",
+                target="coordinator",
+                variable=str(name),
+                value=value,
+                status="sampled",
+            ))
+        safe_log_many(event_logger, events)
     return physics_path
 
 
@@ -362,9 +547,10 @@ def publish_physics_snapshot(
     *,
     sync_backend: str = "filesystem",
     helics_sync: HelicsSync | None = None,
+    event_logger: EventLogger | None = None,
 ) -> Path:  # type: ignore[no-untyped-def]
     """Persist one physics state and release waiting PLC/SCADA daemons."""
-    physics_path = persist_physics_snapshot(runtime_dir, rt, iteration, snapshot)
+    physics_path = persist_physics_snapshot(runtime_dir, rt, iteration, snapshot, event_logger=event_logger)
     release_physics_snapshot(sync_dir, iteration, physics_path, snapshot, sync_backend=sync_backend, helics_sync=helics_sync, rt=rt)
     return physics_path
 
@@ -550,6 +736,25 @@ def prepare_runtime_raw_dir(runtime_dir: Path) -> None:
     if path.exists():
         for old in path.glob("*.jsonl"):
             old.unlink()
+        # Writer snapshots are per-execution quality evidence.  Keeping a
+        # previous PID's clean snapshot could hide a writer killed this run.
+        writer_stats = path / "metric_writer_stats"
+        if writer_stats.exists():
+            shutil.rmtree(writer_stats)
+
+
+def prepare_runtime_json_dir(runtime_dir: Path) -> None:
+    """Remove prior per-iteration JSON so a partial rerun cannot reuse it."""
+    path = json_dir(runtime_dir)
+    if path.exists():
+        for old in path.glob("*.json"):
+            old.unlink()
+
+
+def _runtime_end_status(run_error: BaseException | None, cleanup_errors: list[str]) -> str:
+    if run_error is not None:
+        return "error"
+    return "cleanup_error" if cleanup_errors else "success"
 
 
 
@@ -574,7 +779,35 @@ def _has_iteration_window_attacks(raw_cfg: dict[str, Any]) -> bool:
     return False
 
 
-def _sync_attacks_for_iteration(args: argparse.Namespace, project_root: Path, runtime_dir: Path, iteration: int) -> None:
+def _run_attack_scheduler(
+    cmd: list[str],
+    *,
+    project_root: Path,
+    process_registry: _MetricProcessRegistry | None,
+    component: str,
+) -> None:
+    """Run one scheduler command while exposing its exact process tree."""
+
+    proc = subprocess.Popen(cmd, cwd=str(project_root), text=True)
+    if process_registry is not None:
+        process_registry.add_transient_root(component, proc.pid)
+    try:
+        returncode = proc.wait()
+    finally:
+        if process_registry is not None:
+            process_registry.remove_transient_root(component, proc.pid)
+    if returncode:
+        raise subprocess.CalledProcessError(returncode, cmd)
+
+
+def _sync_attacks_for_iteration(
+    args: argparse.Namespace,
+    project_root: Path,
+    runtime_dir: Path,
+    iteration: int,
+    *,
+    process_registry: _MetricProcessRegistry | None = None,
+) -> None:
     """Synchronize configured attack state before releasing physics_iteration.
 
     MITM proxies and DNAT rules stay online for the full experiment, so SCADA
@@ -599,10 +832,21 @@ def _sync_attacks_for_iteration(args: argparse.Namespace, project_root: Path, ru
         args.python_bin,
     ]
     print(f"[ATTACK-SCHED] sync before releasing physics_{iteration:04d}: {' '.join(cmd)}")
-    subprocess.run(cmd, cwd=str(project_root), text=True, check=True)
+    _run_attack_scheduler(
+        cmd,
+        project_root=project_root,
+        process_registry=process_registry,
+        component="attack-scheduler:sync",
+    )
 
 
-def _stop_configured_attacks(args: argparse.Namespace, project_root: Path, runtime_dir: Path) -> None:
+def _stop_configured_attacks(
+    args: argparse.Namespace,
+    project_root: Path,
+    runtime_dir: Path,
+    *,
+    process_registry: _MetricProcessRegistry | None = None,
+) -> None:
     cmd = [
         args.python_bin,
         "-m",
@@ -616,10 +860,12 @@ def _stop_configured_attacks(args: argparse.Namespace, project_root: Path, runti
         "--python",
         args.python_bin,
     ]
-    try:
-        subprocess.run(cmd, cwd=str(project_root), text=True, check=False)
-    except Exception as exc:
-        print(f"[ATTACK-SCHED][WARN] failed to stop configured attacks: {exc}")
+    _run_attack_scheduler(
+        cmd,
+        project_root=project_root,
+        process_registry=process_registry,
+        component="attack-scheduler:stop",
+    )
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Run persistent Hydro-CPS-Sim closed-loop control")
@@ -677,10 +923,81 @@ def main() -> int:
     json_output_dir = json_dir(runtime_dir)
     prepare_runtime_csv_dir(runtime_dir)
     prepare_runtime_raw_dir(runtime_dir)
+    prepare_runtime_json_dir(runtime_dir)
     clear_ready_files(sync_dir)
     write_json(json_dir(runtime_dir) / "runtime_map.json", rt.to_summary_dict())
+    write_json(runtime_dir / "run_started.json", {
+        "wall_time_ns": time.time_ns(),
+        "pid": os.getpid(),
+        "config": str(args.config),
+        "iterations": args.iterations,
+    })
 
-    physics = PhysicsEngine(rt, mode=args.physics_mode)
+    metrics_cfg = rt.raw.get("metrics", {}) or {}
+    metrics_enabled = isinstance(metrics_cfg, dict) and bool(metrics_cfg.get("enabled", False))
+    event_logger: EventLogger | None = None
+    if metrics_enabled and bool(metrics_cfg.get("event_log", True)):
+        try:
+            event_logger = EventLogger(csv_dir(runtime_dir) / "events.csv")
+        except Exception as exc:
+            print(f"[METRICS][WARN] coordinator event metrics disabled: {exc}")
+    manifest_path = runtime_dir / "manifest.json"
+    resolved_config_path = runtime_dir / "config_resolved.yaml"
+    try:
+        manifest_path, resolved_config_path = write_manifest(
+            args.config,
+            runtime_dir,
+            project_root=project_root,
+        )
+    except Exception as exc:
+        print(f"[METRICS][WARN] manifest unavailable: {exc}")
+    if event_logger is not None:
+        safe_log(event_logger, make_event(
+            iteration=-1,
+            layer="runtime",
+            component="coordinator",
+            event_type="simulation_start",
+            source="coordinator",
+            status="started",
+            details={
+                "config": str(args.config),
+                "manifest": str(manifest_path),
+                "resolved_config": str(resolved_config_path),
+                "iterations": args.iterations,
+            },
+        ))
+
+    if args.dry_run:
+        print("[DRY-RUN] Runtime map and sync directory prepared only.")
+        safe_log(event_logger, make_event(
+            iteration=-1,
+            layer="runtime",
+            component="coordinator",
+            event_type="simulation_end",
+            source="coordinator",
+            status="dry_run",
+            details={"completed_cycles": 0},
+        ))
+        return 0
+
+    try:
+        physics = PhysicsEngine(rt, mode=args.physics_mode)
+    except BaseException as exc:
+        safe_log(event_logger, make_event(
+            iteration=-1,
+            layer="runtime",
+            component="coordinator",
+            event_type="simulation_end",
+            source="coordinator",
+            status="error",
+            details={
+                "stage": "physics_initialization",
+                "completed_cycles": 0,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        ))
+        raise
     actuator_state = dict(rt.actuator_initial_state)
 
     attack_scheduling_enabled = bool(_enabled_attack_scenarios(rt.raw))
@@ -699,15 +1016,17 @@ def main() -> int:
         print(f"  - {plc.name:5s} ns={plc.namespace:10s} ip={plc.ip:15s} md={len(plc.md_vars)} coils={len(plc.coil_vars)}")
     print("=" * 80)
 
-    if args.dry_run:
-        print("[DRY-RUN] Runtime map and sync directory prepared only.")
-        return 0
-
     processes: dict[str, subprocess.Popen] = {}
     log_handles: list[Any] = []
     cycle_summaries: list[dict[str, Any]] = []
     timing_rows: list[dict[str, Any]] = []
     coord_sync: HelicsSync | None = None
+    resource_monitor: RuntimeMonitor | None = None
+    process_registry = _MetricProcessRegistry(rt, runtime_dir)
+    run_error: BaseException | None = None
+    cleanup_errors: list[str] = []
+    metric_writer_quality: dict[str, Any] | None = None
+    current_iteration = -1
 
     try:
         if args.init_style == "dhalsim":
@@ -716,7 +1035,7 @@ def main() -> int:
             # tank/actuator initial state.  Row 0 is persisted for CSV alignment
             # only; it is not released to PLC/SCADA to avoid false zero inputs.
             zero_snapshot = physics.dhalsim_zero_snapshot(iteration=0)
-            zero_path = persist_physics_snapshot(runtime_dir, rt, 0, zero_snapshot)
+            zero_path = persist_physics_snapshot(runtime_dir, rt, 0, zero_snapshot, event_logger=event_logger)
             print(
                 f"[INIT] physics_0000 DHALSIM dummy backend={zero_snapshot.get('backend')} "
                 f"values={len(zero_snapshot.get('values', {}))} -> {zero_path}"
@@ -734,12 +1053,33 @@ def main() -> int:
             control_iterations = max(0, final_physics_iteration - first_control_iteration)
             initial_snapshot = physics.current_snapshot(iteration=initial_iteration)
 
+        if metrics_enabled and bool(metrics_cfg.get("resource_monitor", True)):
+            sample_interval = float(metrics_cfg.get("sample_interval_sec", 0.5) or 0.5)
+            try:
+                resource_monitor = RuntimeMonitor(
+                    csv_dir(runtime_dir) / "resources.csv",
+                    process_registry.resolve(),
+                    interval_sec=sample_interval,
+                    include_process_tree=False,
+                    process_resolver=process_registry.resolve,
+                ).start()
+            except Exception as exc:
+                resource_monitor = None
+                print(f"[METRICS][WARN] resource monitoring disabled: {exc}")
+                cleanup_errors.append(f"resources_start:{type(exc).__name__}:{exc}")
+
         if attack_scheduling_enabled:
             # Bring MITM proxies and DNAT rules online before the SCADA daemon starts.
             # The proxy begins in transparent mode outside the configured iteration
             # window, allowing SCADA to keep persistent Modbus/TCP connections while
             # the proxy toggles modification behavior by state file.
-            _sync_attacks_for_iteration(args, project_root, runtime_dir, initial_iteration)
+            _sync_attacks_for_iteration(
+                args,
+                project_root,
+                runtime_dir,
+                initial_iteration,
+                process_registry=process_registry,
+            )
 
         processes, log_handles = launch_daemons(
             args,
@@ -750,6 +1090,12 @@ def main() -> int:
             start_iteration=first_control_iteration,
             max_iterations=control_iterations,
         )
+        process_registry.set_runtime_processes(processes)
+        if resource_monitor is not None:
+            try:
+                resource_monitor.refresh_processes()
+            except Exception as exc:
+                print(f"[METRICS][WARN] could not refresh monitored processes: {exc}")
 
         if args.sync_backend == "helics":
             coord_sync = HelicsSync.from_args(
@@ -764,7 +1110,13 @@ def main() -> int:
         # marker until PLC memories have been preloaded. This prevents cold-start
         # scans over default 0.0 dependency values from corrupting hysteresis
         # outputs.
-        input_physics_path = persist_physics_snapshot(runtime_dir, rt, initial_iteration, initial_snapshot)
+        input_physics_path = persist_physics_snapshot(
+            runtime_dir,
+            rt,
+            initial_iteration,
+            initial_snapshot,
+            event_logger=event_logger,
+        )
         print(
             f"[INIT] physics_{initial_iteration:04d} backend={initial_snapshot.get('backend')} "
             f"values={len(initial_snapshot.get('values', {}))} -> {input_physics_path}"
@@ -791,6 +1143,7 @@ def main() -> int:
             print("[DONE] No control cycles requested after initialization.")
 
         for i in range(first_control_iteration, final_physics_iteration):
+            current_iteration = i
             cycle_start = time.monotonic()
             timing: dict[str, Any] = {
                 "iteration": i,
@@ -860,16 +1213,111 @@ def main() -> int:
             actuator_state.update(merge_actuator_files(actuator_paths))
             actuator_path = json_output_dir / f"actuator_state_{i:04d}.json"
             write_json(actuator_path, actuator_state)
-            _write_actuator_state_csv(runtime_dir, i, actuator_state)
+            _write_actuator_state_csv(
+                runtime_dir,
+                i,
+                actuator_state,
+            )
             timing["merge_actuator_state_sec"] = time.monotonic() - merge_t0
             print(f"[CYCLE {i}] actuator_state_{i:04d} -> {actuator_path}: {actuator_state}")
 
             # 5) Apply u_i to the plant interval that produces x_{i+1}.
             physics_t0 = time.monotonic()
-            next_physics_snapshot = physics.step(actuator_state, iteration=i + 1)
-            output_physics_path = persist_physics_snapshot(runtime_dir, rt, i + 1, next_physics_snapshot)
+            physics_wall_start_ns = time.time_ns()
+            physics_monotonic_start_ns = time.monotonic_ns()
+            safe_log(event_logger, make_event(
+                wall_time_ns=physics_wall_start_ns,
+                monotonic_ns=physics_monotonic_start_ns,
+                iteration=i + 1,
+                layer="physical",
+                component="epanet",
+                event_type="physics_iteration_start",
+                source="coordinator",
+                target="epanet",
+                status="started",
+                details={"actuator_iteration": i},
+            ))
+            try:
+                next_physics_snapshot = physics.step(actuator_state, iteration=i + 1)
+            except Exception as exc:
+                physics_monotonic_end_ns = time.monotonic_ns()
+                safe_log(event_logger, make_event(
+                    iteration=i + 1,
+                    layer="physical",
+                    component="epanet",
+                    event_type="physics_iteration_end",
+                    source="epanet",
+                    target="coordinator",
+                    status="error",
+                    details={
+                        "stage": "physics_step",
+                        "duration_ms": (physics_monotonic_end_ns - physics_monotonic_start_ns) / 1_000_000.0,
+                        "error": str(exc),
+                        "type": type(exc).__name__,
+                    },
+                ))
+                raise
+            physics_wall_end_ns = time.time_ns()
+            physics_monotonic_end_ns = time.monotonic_ns()
+            safe_log_many(event_logger, [
+                make_event(
+                    wall_time_ns=physics_wall_start_ns,
+                    monotonic_ns=physics_monotonic_start_ns,
+                    iteration=i + 1,
+                    layer="physical",
+                    component="epanet",
+                    event_type="physics_actuator_input",
+                    source="coordinator",
+                    target="epanet",
+                    variable=name,
+                    value=bool(value),
+                    status="applied",
+                    details={"actuator_iteration": i},
+                )
+                for name, value in sorted(actuator_state.items())
+            ])
+            safe_log(event_logger, make_event(
+                wall_time_ns=physics_wall_end_ns,
+                monotonic_ns=physics_monotonic_end_ns,
+                iteration=i + 1,
+                layer="physical",
+                component="epanet",
+                event_type="physics_iteration_end",
+                source="epanet",
+                target="coordinator",
+                status="success",
+                details={
+                    "duration_ms": (physics_monotonic_end_ns - physics_monotonic_start_ns) / 1_000_000.0,
+                    "value_count": len(next_physics_snapshot.get("values", {}) or {}),
+                },
+            ))
+            try:
+                output_physics_path = persist_physics_snapshot(
+                    runtime_dir,
+                    rt,
+                    i + 1,
+                    next_physics_snapshot,
+                    event_logger=event_logger,
+                )
+            except Exception as exc:
+                safe_log(event_logger, make_event(
+                    iteration=i + 1,
+                    layer="physical",
+                    component="persistence",
+                    event_type="physics_snapshot_persist_error",
+                    source="coordinator",
+                    status="error",
+                    details={"error": str(exc), "type": type(exc).__name__},
+                ))
+                raise
             if attack_scheduling_enabled:
-                _sync_attacks_for_iteration(args, project_root, runtime_dir, i + 1)
+                _sync_attacks_for_iteration(
+                    args,
+                    project_root,
+                    runtime_dir,
+                    i + 1,
+                    process_registry=process_registry,
+                )
             release_physics_snapshot(
                 sync_dir,
                 i + 1,
@@ -940,20 +1388,76 @@ def main() -> int:
             _write_timing_summary_csv(runtime_dir, timing_rows)
 
 
+    except BaseException as exc:
+        run_error = exc
+        raise
     finally:
         _send_helics_stop(coord_sync, rt)
         try:
             if coord_sync is not None:
                 coord_sync.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            cleanup_errors.append(f"helics:{type(exc).__name__}:{exc}")
         try:
             physics.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            cleanup_errors.append(f"physics:{type(exc).__name__}:{exc}")
         if bool(_enabled_attack_scenarios(rt.raw)):
-            _stop_configured_attacks(args, project_root, runtime_dir)
-        stop_daemons(processes, log_handles, sync_dir)
+            try:
+                _stop_configured_attacks(
+                    args,
+                    project_root,
+                    runtime_dir,
+                    process_registry=process_registry,
+                )
+            except Exception as exc:
+                cleanup_errors.append(f"attacks:{type(exc).__name__}:{exc}")
+        try:
+            stop_daemons(processes, log_handles, sync_dir)
+        except Exception as exc:
+            cleanup_errors.append(f"daemons:{type(exc).__name__}:{exc}")
+        try:
+            if resource_monitor is not None:
+                resource_monitor.stop(timeout=2.0)
+        except Exception as exc:
+            cleanup_errors.append(f"resources:{type(exc).__name__}:{exc}")
+        if metrics_enabled:
+            try:
+                required_writers = (
+                    required_metric_writers(rt.raw)
+                    if run_error is None
+                    else set()
+                )
+                metric_writer_quality = analyze_metric_writer_stats(
+                    runtime_dir / "raw" / "metric_writer_stats",
+                    required_writers=required_writers,
+                )
+                cleanup_errors.extend(
+                    f"metric_writer_quality:{error}"
+                    for error in metric_writer_quality["quality_errors"]
+                )
+            except Exception as exc:
+                cleanup_errors.append(f"metric_writer_quality:{type(exc).__name__}:{exc}")
+        end_status = _runtime_end_status(run_error, cleanup_errors)
+        end_iteration = current_iteration if run_error is not None else int(args.iterations)
+        safe_log(event_logger, make_event(
+            iteration=end_iteration,
+            layer="runtime",
+            component="coordinator",
+            event_type="simulation_end",
+            source="coordinator",
+            status=end_status,
+            details={
+                "completed_cycles": len(cycle_summaries),
+                "error_type": type(run_error).__name__ if run_error is not None else "",
+                "error": str(run_error) if run_error is not None else "",
+                "cleanup_errors": cleanup_errors,
+                "metric_writer_quality": metric_writer_quality,
+            },
+        ))
+
+    if cleanup_errors:
+        raise RuntimeError("runtime cleanup failed: " + "; ".join(cleanup_errors))
 
     print("\n[DONE] Persistent closed-loop run finished.")
     print(f"[PHYSICS-CSV] {csv_dir(runtime_dir) / 'physics.csv'}")
