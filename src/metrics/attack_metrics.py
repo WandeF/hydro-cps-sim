@@ -33,6 +33,13 @@ def _wall_time_ns(row: dict[str, Any]) -> int:
         return time.time_ns()
 
 
+def _monotonic_ns(row: dict[str, Any]) -> int:
+    try:
+        return int(row.get("monotonic_ns"))
+    except (TypeError, ValueError):
+        return time.monotonic_ns()
+
+
 class AttackMetricRecorder:
     def __init__(self, runtime_dir: Path):
         runtime_dir = Path(runtime_dir)
@@ -65,7 +72,7 @@ class AttackMetricRecorder:
             status = str(row.get("status", "active"))
         safe_log(self.logger, MetricEvent(
             wall_time_ns=_wall_time_ns(row),
-            monotonic_ns=time.monotonic_ns(),
+            monotonic_ns=_monotonic_ns(row),
             iteration=_iteration(row.get("iteration")),
             layer="attack",
             component=attack or "attacker",

@@ -93,6 +93,45 @@ def _memory_gb() -> float | None:
         return None
 
 
+def _network_impairments(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Describe every directional ns-3 receive error model explicitly."""
+    network = cfg.get("network", {}) or {}
+    if not isinstance(network, dict):
+        return []
+    result: list[dict[str, Any]] = []
+    for link in network.get("backbone_links", []) or []:
+        if not isinstance(link, dict) or not isinstance(link.get("error_model"), dict):
+            continue
+        endpoints = link.get("endpoints", [])
+        if not isinstance(endpoints, list) or len(endpoints) != 2:
+            continue
+        a, b = str(endpoints[0]), str(endpoints[1])
+        error = link["error_model"]
+        raw_direction = str(error.get("direction", "both")).strip().lower().replace("_", "-")
+        directions = {
+            "both": [(a, b, 0), (b, a, 1)],
+            "a-to-b": [(a, b, 0)],
+            "b-to-a": [(b, a, 0)],
+            f"{a.lower()}-to-{b.lower()}": [(a, b, 0)],
+            f"{b.lower()}-to-{a.lower()}": [(b, a, 0)],
+        }.get(raw_direction, [])
+        stream_base = int(error.get("stream", 1) or 0)
+        for source, receive, offset in directions:
+            result.append(
+                {
+                    "link_name": str(link.get("name", "")),
+                    "direction": f"{source}-to-{receive}",
+                    "source_device": source,
+                    "receive_device": receive,
+                    "error_model_type": str(error.get("type", "rate")),
+                    "error_unit": str(error.get("unit", "packet")),
+                    "configured_error_rate": float(error.get("error_rate", 0.0) or 0.0),
+                    "random_stream": stream_base + offset,
+                }
+            )
+    return result
+
+
 def build_manifest(
     config_path: Path,
     *,
@@ -112,8 +151,11 @@ def build_manifest(
     timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
     output_dir = resolve_output_dir(config_path, cfg)
 
+    ns3_run = int(experiment.get("ns3_run", experiment.get("repetition", 1)) or 1)
+    drain_period_sec = float(experiment.get("drain_period_sec", 0.0) or 0.0)
+
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "experiment_id": resolved_id,
         "group": experiment.get("group", ""),
         "parameter": experiment.get("parameter", ""),
@@ -125,6 +167,10 @@ def build_manifest(
         "config_sha256": sha256_file(config_path),
         "output_dir": str(output_dir),
         "random_seed": random_seed,
+        "ns3_seed": random_seed,
+        "ns3_run": ns3_run,
+        "error_models": _network_impairments(cfg),
+        "drain_period_sec": drain_period_sec,
         "iterations": int(cfg.get("iterations", 1) or 1),
         "hydraulic_step_sec": _hydraulic_timestep(cfg),
         "host": {

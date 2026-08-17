@@ -41,6 +41,22 @@ NETWORK_COLUMNS = [
     "rx_packets",
     "lost_packets",
     "drop_packets",
+    "error_model_drop_packets",
+    "queue_drop_packets",
+    "other_classified_losses",
+    "network_conservation_ok",
+    "queue_enqueue_count",
+    "queue_dequeue_count",
+    "queue_capacity_packets",
+    "queue_packets_mean",
+    "queue_packets_max",
+    "queue_packets_current",
+    "queue_samples",
+    "queue_occupancy_ratio_mean",
+    "queue_occupancy_ratio_max",
+    "first_queue_nonzero_time_s",
+    "first_queue_full_time_s",
+    "first_queue_drop_time_s",
     "tx_bytes",
     "rx_bytes",
     "delay_samples",
@@ -175,6 +191,22 @@ def parse_flow_monitor_xml(path: Path | str) -> list[dict[str, Any]]:
                 "rx_packets": rx_packets,
                 "lost_packets": lost_packets,
                 "drop_packets": _drop_count(flow),
+                "error_model_drop_packets": None,
+                "queue_drop_packets": None,
+                "other_classified_losses": None,
+                "network_conservation_ok": None,
+                "queue_enqueue_count": None,
+                "queue_dequeue_count": None,
+                "queue_capacity_packets": None,
+                "queue_packets_mean": None,
+                "queue_packets_max": None,
+                "queue_packets_current": None,
+                "queue_samples": None,
+                "queue_occupancy_ratio_mean": None,
+                "queue_occupancy_ratio_max": None,
+                "first_queue_nonzero_time_s": None,
+                "first_queue_full_time_s": None,
+                "first_queue_drop_time_s": None,
                 "tx_bytes": tx_bytes,
                 "rx_bytes": rx_bytes,
                 "delay_samples": rx_packets,
@@ -205,7 +237,36 @@ def parse_link_metrics_csv(path: Path | str) -> list[dict[str, Any]]:
     for item in source_rows:
         tx_packets = _int(item.get("tx_packets"))
         rx_packets = _int(item.get("rx_packets"))
-        drop_packets = _int(item.get("drop_packets"))
+        raw_drop_packets = _int(item.get("drop_packets"))
+        queue_drop_packets = _int(item.get("queue_drop_packets"))
+        pending_packets = _int(item.get("pending_packets"))
+        # New snapshots report the RateErrorModel and queue components
+        # independently.  For legacy snapshots, subtract queue drops from the
+        # combined drop counter so old evidence remains readable without
+        # counting a queue drop twice.
+        if item.get("error_model_drop_packets") in (None, ""):
+            error_model_drop_packets = max(0, raw_drop_packets - queue_drop_packets)
+        else:
+            error_model_drop_packets = _int(item.get("error_model_drop_packets"))
+        other_classified_losses = max(
+            0,
+            tx_packets
+            - rx_packets
+            - error_model_drop_packets
+            - queue_drop_packets
+            - pending_packets,
+        )
+        drop_packets = (
+            error_model_drop_packets + queue_drop_packets + other_classified_losses
+        )
+        conservation_ok = (
+            tx_packets
+            == rx_packets
+            + error_model_drop_packets
+            + queue_drop_packets
+            + other_classified_losses
+            + pending_packets
+        )
         rx_bytes = _int(item.get("rx_bytes"))
         simulation_time_s = _float(item.get("simulation_time_s"))
         delay_samples = _int(item.get("delay_samples"))
@@ -263,6 +324,22 @@ def parse_link_metrics_csv(path: Path | str) -> list[dict[str, Any]]:
                 # packets are reported separately and are not declared lost.
                 "lost_packets": drop_packets,
                 "drop_packets": drop_packets,
+                "error_model_drop_packets": error_model_drop_packets,
+                "queue_drop_packets": queue_drop_packets,
+                "other_classified_losses": other_classified_losses,
+                "network_conservation_ok": conservation_ok,
+                "queue_enqueue_count": _int(item.get("queue_enqueue_packets")),
+                "queue_dequeue_count": _int(item.get("queue_dequeue_packets")),
+                "queue_capacity_packets": _int(item.get("queue_capacity_packets")),
+                "queue_packets_mean": _float(item.get("queue_packets_mean")),
+                "queue_packets_max": _int(item.get("queue_packets_max")),
+                "queue_packets_current": _int(item.get("queue_packets_current")),
+                "queue_samples": _int(item.get("queue_samples")),
+                "queue_occupancy_ratio_mean": _float(item.get("queue_occupancy_ratio_mean")),
+                "queue_occupancy_ratio_max": _float(item.get("queue_occupancy_ratio_max")),
+                "first_queue_nonzero_time_s": _float(item.get("first_queue_nonzero_time_s"), -1.0),
+                "first_queue_full_time_s": _float(item.get("first_queue_full_time_s"), -1.0),
+                "first_queue_drop_time_s": _float(item.get("first_queue_drop_time_s"), -1.0),
                 "tx_bytes": _int(item.get("tx_bytes")),
                 "rx_bytes": rx_bytes,
                 "delay_samples": delay_samples,
@@ -284,7 +361,7 @@ def parse_link_metrics_csv(path: Path | str) -> list[dict[str, Any]]:
                     if simulation_time_s > 0 and configured_data_rate_bps not in (None, 0.0)
                     else None
                 ),
-                "pending_packets": _int(item.get("pending_packets")),
+                "pending_packets": pending_packets,
                 "times_forwarded": "",
             }
         )
@@ -296,6 +373,21 @@ def _aggregate_source(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
     tx_packets = sum(_int(row.get("tx_packets")) for row in rows)
     rx_packets = sum(_int(row.get("rx_packets")) for row in rows)
     drops = sum(_int(row.get("drop_packets")) for row in rows)
+    error_model_drops = sum(_int(row.get("error_model_drop_packets")) for row in rows)
+    queue_drops = sum(_int(row.get("queue_drop_packets")) for row in rows)
+    other_losses = sum(_int(row.get("other_classified_losses")) for row in rows)
+    pending = sum(_int(row.get("pending_packets")) for row in rows)
+    queue_maxima = [
+        _int(row.get("queue_packets_max"))
+        for row in rows
+        if row.get("queue_packets_max") not in (None, "")
+    ]
+    queue_weight = sum(_int(row.get("queue_samples")) for row in rows)
+    queue_weighted_sum = sum(
+        _float(row.get("queue_packets_mean")) * _int(row.get("queue_samples"))
+        for row in rows
+        if row.get("queue_packets_mean") not in (None, "")
+    )
     lost = sum(_int(row.get("lost_packets")) for row in rows)
     delay_samples = sum(_int(row.get("delay_samples")) for row in rows)
     weighted_delay = sum(
@@ -317,6 +409,17 @@ def _aggregate_source(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "rx_packets": rx_packets,
         "lost_packets": lost,
         "drop_packets": drops,
+        "error_model_drop_packets": error_model_drops,
+        "queue_drop_packets": queue_drops,
+        "other_classified_losses": other_losses,
+        "pending_packets": pending,
+        "network_conservation_ok": (
+            tx_packets == rx_packets + error_model_drops + queue_drops + other_losses + pending
+            if rows and all(row.get("network_conservation_ok") is not None for row in rows)
+            else None
+        ),
+        "queue_packets_mean": queue_weighted_sum / queue_weight if queue_weight else None,
+        "queue_packets_max": max(queue_maxima) if queue_maxima else None,
         "delay_samples": delay_samples,
         "mean_delay_ms": weighted_delay / delay_samples if delay_samples else None,
         "packet_loss_rate": lost / tx_packets if tx_packets else None,

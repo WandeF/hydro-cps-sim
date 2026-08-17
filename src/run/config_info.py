@@ -42,6 +42,12 @@ def main() -> int:
     openplc_path = _resolve_path(config_path, cfg.get("openplc_path"), default="../OpenPLC_v3")
     ns3_path = _resolve_path(config_path, cfg.get("ns3_path"), default="../ns-3-dev-git")
     iterations = int(cfg.get("iterations", 100) or 100)
+    experiment = cfg.get("experiment", {}) or {}
+    drain_period_sec = (
+        float(experiment.get("drain_period_sec", 0.0) or 0.0)
+        if isinstance(experiment, dict)
+        else 0.0
+    )
 
     values = {
         "CONFIG_ABS": str(config_path),
@@ -49,6 +55,7 @@ def main() -> int:
         "OPENPLC_PATH": str(openplc_path),
         "NS3_PATH": str(ns3_path),
         "ITERATIONS_FROM_CONFIG": str(iterations),
+        "DRAIN_PERIOD_FROM_CONFIG": str(drain_period_sec),
     }
     for key, value in values.items():
         print(f"{key}={shlex.quote(value)}")

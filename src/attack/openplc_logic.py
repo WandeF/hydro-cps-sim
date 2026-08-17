@@ -10,6 +10,7 @@ OpenPLC web UI, credentials, or external hosts.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -54,6 +55,20 @@ def _state_payload(path: Path) -> dict[str, Any]:
 def _write_state(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _append_log(path: Path, message: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{time.time():.6f} {message}\n")
 
 
 class EventWriter:
@@ -369,7 +384,7 @@ def inject_logic(text: str, target: str, injection: dict[str, Any]) -> tuple[str
     return _inject_invert_condition(text, target, injection)
 
 
-def _compile_one(config_path: Path, target: str) -> None:
+def _compile_one(config_path: Path, target: str, *, compile_log: Path | None = None) -> None:
     cfg = load_yaml(config_path)
     rt = load_runtime_config(config_path)
     openplc_root = resolve_openplc_root(config_path, cfg, None)
@@ -384,7 +399,21 @@ def _compile_one(config_path: Path, target: str) -> None:
         raise FileNotFoundError(f"OpenPLC compile script not found: {compile_script}")
     st_files_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(st_path, st_files_dir / st_path.name)
-    subprocess.run(["bash", str(compile_script), st_path.name], cwd=str(webserver_dir), check=True)
+    if compile_log is None:
+        subprocess.run(["bash", str(compile_script), st_path.name], cwd=str(webserver_dir), check=True)
+    else:
+        compile_log.parent.mkdir(parents=True, exist_ok=True)
+        with compile_log.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n[{time.time():.6f}] compile target={target} source={st_path}\n")
+            handle.flush()
+            subprocess.run(
+                ["bash", str(compile_script), st_path.name],
+                cwd=str(webserver_dir),
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                check=True,
+                text=True,
+            )
     if not built_binary.exists():
         raise FileNotFoundError(f"OpenPLC built binary not found: {built_binary}")
     copy_binary_atomic(built_binary, binary_path)
@@ -424,21 +453,40 @@ def apply_injection(args: argparse.Namespace) -> int:
     state = _state_payload(args.state_file)
     backup_path = Path(state.get("backup_path") or args.backup_file)
     backup_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_stem = f"{args.attack}_{target}".replace("/", "_")
+    malicious_path = args.runtime_dir / "attack_runtime" / f"{artifact_stem}.malicious.st"
+    compile_log = args.runtime_dir / "logs" / f"{artifact_stem}.compile.log"
+    deploy_log = args.runtime_dir / "logs" / f"{artifact_stem}.deploy.log"
 
     original = plc.st_path.read_text(encoding="utf-8")
+    binary_path = rt.output_dir / "plcs" / target.lower()
+    before_source_hash = _sha256(plc.st_path)
+    before_binary_hash = _sha256(binary_path) if binary_path.is_file() else ""
     if not backup_path.exists():
         shutil.copy2(plc.st_path, backup_path)
     injected, message = inject_logic(original, target, args.injection)
     if injected == original:
         raise RuntimeError("injection did not change PLC logic")
     plc.st_path.write_text(injected, encoding="utf-8")
+    malicious_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(plc.st_path, malicious_path)
+    after_source_hash = _sha256(plc.st_path)
     try:
-        _compile_one(args.config, target)
+        _write_event(events, args, "openplc_compile_start", f"compile malicious {target}")
+        _compile_one(args.config, target, compile_log=compile_log)
+        _write_event(events, args, "openplc_compile_end", f"compiled malicious {target}")
+        after_binary_hash = _sha256(binary_path)
+        _write_event(events, args, "openplc_deploy_start", f"deploy malicious {target}")
         plc_pid = _restart_runtime(args.config, args.runtime_dir, target, args.namespace)
+        _append_log(
+            deploy_log,
+            f"deployed malicious binary target={target} namespace={args.namespace} pid={plc_pid} "
+            f"sha256={after_binary_hash}",
+        )
     except Exception:
         shutil.copy2(backup_path, plc.st_path)
         try:
-            _compile_one(args.config, target)
+            _compile_one(args.config, target, compile_log=compile_log)
             _restart_runtime(args.config, args.runtime_dir, target, args.namespace)
         except Exception as rollback_exc:
             print(f"[OPENPLC-LOGIC] rollback failed: {rollback_exc}", file=sys.stderr, flush=True)
@@ -451,7 +499,16 @@ def apply_injection(args: argparse.Namespace) -> int:
             "namespace": args.namespace,
             "active": True,
             "backup_path": str(backup_path),
+            "original_st_path": str(backup_path),
+            "malicious_st_path": str(malicious_path),
             "st_path": str(plc.st_path),
+            "compile_log_path": str(compile_log),
+            "deploy_log_path": str(deploy_log),
+            "before_source_sha256": before_source_hash,
+            "after_source_sha256": after_source_hash,
+            "before_executable_sha256": before_binary_hash,
+            "after_executable_sha256": after_binary_hash,
+            "malicious_logic_deployed": True,
             "restore_on_stop": bool(args.restore_on_stop),
             "updated_epoch": time.time(),
             "plc_pid": plc_pid,
@@ -473,13 +530,23 @@ def restore_logic(args: argparse.Namespace) -> int:
     state = _state_payload(args.state_file)
     backup_path = Path(state.get("backup_path") or args.backup_file)
     events = EventWriter(args.runtime_dir)
+    artifact_stem = f"{args.attack}_{target}".replace("/", "_")
+    compile_log = args.runtime_dir / "logs" / f"{artifact_stem}.compile.log"
+    deploy_log = args.runtime_dir / "logs" / f"{artifact_stem}.deploy.log"
 
     if not backup_path.exists():
         _write_event(events, args, "openplc_logic_restore_skip", f"backup not found: {backup_path}")
         return 0
     shutil.copy2(backup_path, plc.st_path)
-    _compile_one(args.config, target)
+    _compile_one(args.config, target, compile_log=compile_log)
     plc_pid = _restart_runtime(args.config, args.runtime_dir, target, args.namespace)
+    restored_binary = rt.output_dir / "plcs" / target.lower()
+    restored_hash = _sha256(restored_binary) if restored_binary.is_file() else ""
+    _append_log(
+        deploy_log,
+        f"deployed restored binary target={target} namespace={args.namespace} pid={plc_pid} "
+        f"sha256={restored_hash}",
+    )
     state.update(
         {
             "attack": args.attack,
@@ -488,6 +555,7 @@ def restore_logic(args: argparse.Namespace) -> int:
             "active": False,
             "restored_epoch": time.time(),
             "plc_pid": plc_pid,
+            "restored_executable_sha256": restored_hash,
         }
     )
     _write_state(args.state_file, state)

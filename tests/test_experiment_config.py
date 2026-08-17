@@ -254,6 +254,29 @@ class ExperimentConfigTests(unittest.TestCase):
             self.assertEqual(64, len(manifest["config_sha256"]))
             self.assertIn("commit", manifest["git"])
 
+    def test_manifest_records_directional_error_models(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "config.yaml"
+            config.write_text(yaml.safe_dump({
+                "output_path": "output",
+                "experiment": {"random_seed": 101, "ns3_run": 9, "drain_period_sec": 2},
+                "network": {"backbone_links": [{
+                    "name": "r0-r4",
+                    "endpoints": ["r0", "r4"],
+                    "error_model": {
+                        "type": "rate", "unit": "packet", "error_rate": 0.005,
+                        "direction": "both", "stream": 50,
+                    },
+                }]},
+            }), encoding="utf-8")
+            manifest = build_manifest(config, project_root=Path(__file__).resolve().parents[1])
+        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["ns3_seed"], 101)
+        self.assertEqual(manifest["ns3_run"], 9)
+        self.assertEqual(manifest["drain_period_sec"], 2.0)
+        self.assertEqual([50, 51], [item["random_stream"] for item in manifest["error_models"]])
+
 
 if __name__ == "__main__":
     unittest.main()

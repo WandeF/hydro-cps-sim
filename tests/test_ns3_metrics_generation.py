@@ -59,8 +59,13 @@ class Ns3MetricsGenerationTests(unittest.TestCase):
             self.assertIn(str(output_dir / "runtime/network/flow-monitor.xml"), source)
             self.assertIn(str(output_dir / "runtime/network/link-metrics.csv"), source)
             self.assertIn("RegisterLinkDirection", source)
-            self.assertIn("MacTxDrop", source)
+            self.assertIn("LinkErrorDrop", source)
             self.assertIn("PhyRxDrop", source)
+            self.assertIn("QueueEnqueue", source)
+            self.assertIn("QueueDequeue", source)
+            self.assertIn("QueueDrop", source)
+            self.assertIn("error_model_drop_packets,queue_enqueue_packets", source)
+            self.assertIn("queue_occupancy_ratio_mean,queue_occupancy_ratio_max", source)
             self.assertIn("g_linkMetricsInterval = Seconds (0.250000000)", source)
             self.assertIn('SetQueue ("ns3::DropTailQueue<Packet>"', source)
             self.assertIn('QueueSize ("50p")', source)
@@ -73,6 +78,25 @@ class Ns3MetricsGenerationTests(unittest.TestCase):
             self.assertIn("FlowMonitor may therefore contain no flows", source)
             self.assertIn("RngSeedManager::SetSeed (1003)", source)
             self.assertIn("RngSeedManager::SetRun (3)", source)
+
+    def test_directional_error_stream_queue_timeseries_and_pcap_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp).resolve()
+            config = _config(output_dir)
+            config["network"]["measurement"].update({
+                "pcap_links": [],
+                "queue_timeseries": {"enabled": True, "interval": "20ms"},
+            })
+            error = config["network"]["backbone_links"][0]["error_model"]
+            error.update({"direction": "a-to-b", "stream": 17})
+            source = generate_cc(config, output_dir)
+
+            self.assertIn("g_queueTimeseriesEnabled = true", source)
+            self.assertIn("g_queueTimeseriesInterval = Seconds (0.020000000)", source)
+            self.assertIn(str(output_dir / "runtime/network/queue-timeseries.csv"), source)
+            self.assertIn("AssignStreams (17)", source)
+            self.assertEqual(source.count("CreateObject<RateErrorModel>"), 1)
+            self.assertNotIn("EnablePcap", source)
 
     def test_master_switch_disables_measurement_features(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

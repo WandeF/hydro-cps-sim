@@ -98,7 +98,16 @@ def measurement_options(network_cfg: dict[str, Any]) -> dict[str, Any]:
     """Normalize optional network.measurement feature flags."""
     raw = network_cfg.get("measurement", {})
     if not isinstance(raw, dict) or not bool(raw.get("enabled", False)):
-        return {"enabled": False, "flow_monitor": False, "link_metrics": False, "pcap": False, "interval": "1s"}
+        return {
+            "enabled": False,
+            "flow_monitor": False,
+            "link_metrics": False,
+            "pcap": False,
+            "pcap_links": None,
+            "interval": "1s",
+            "queue_timeseries": False,
+            "queue_interval": "10ms",
+        }
 
     link_raw = raw.get("link_metrics", False)
     link_enabled = bool(link_raw.get("enabled", False)) if isinstance(link_raw, dict) else bool(link_raw)
@@ -118,12 +127,33 @@ def measurement_options(network_cfg: dict[str, Any]) -> dict[str, Any]:
     if match is None or float(match.group(1)) <= 0:
         raise ValueError("network.measurement link metric interval must be positive")
 
+    raw_pcap_links = raw.get("pcap_links")
+    if raw_pcap_links is None:
+        pcap_links = None
+    elif isinstance(raw_pcap_links, (list, tuple)):
+        pcap_links = {str(item).strip() for item in raw_pcap_links if str(item).strip()}
+    else:
+        raise ValueError("network.measurement.pcap_links must be a list")
+
+    queue_raw = raw.get("queue_timeseries", False)
+    queue_enabled = bool(queue_raw.get("enabled", False)) if isinstance(queue_raw, dict) else bool(queue_raw)
+    queue_interval = queue_raw.get("interval", "10ms") if isinstance(queue_raw, dict) else "10ms"
+    if isinstance(queue_interval, (int, float)):
+        queue_interval = f"{queue_interval}s"
+    queue_interval_expr = time_value_expr(str(queue_interval))
+    queue_match = re.search(r"Seconds \(([0-9.]+)\)", queue_interval_expr)
+    if queue_match is None or float(queue_match.group(1)) <= 0:
+        raise ValueError("network.measurement queue timeseries interval must be positive")
+
     return {
         "enabled": True,
         "flow_monitor": bool(raw.get("flow_monitor", False)),
         "link_metrics": link_enabled,
         "pcap": bool(raw.get("pcap", False)),
+        "pcap_links": pcap_links,
         "interval": str(interval),
+        "queue_timeseries": queue_enabled,
+        "queue_interval": str(queue_interval),
     }
 
 
@@ -198,6 +228,7 @@ def emit_header(*, flow_monitor: bool = False, link_metrics: bool = False):
         includes += '#include "ns3/flow-monitor-module.h"\n'
     includes += r'''
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -271,15 +302,30 @@ struct LinkDirectionMetrics
   uint64_t txBytes {0};
   uint64_t rxBytes {0};
   uint64_t dropPackets {0};
+  uint64_t errorModelDropPackets {0};
+  uint64_t queueDropPackets {0};
+  uint64_t queueEnqueuePackets {0};
+  uint64_t queueDequeuePackets {0};
+  uint64_t queueCapacityPackets {0};
+  uint64_t queuePacketsCurrent {0};
+  uint64_t queuePacketsMaximum {0};
+  uint64_t queuePacketsSamples {1};
+  uint64_t queuePacketsSum {0};
   uint64_t delaySamples {0};
   int64_t delaySumNs {0};
   int64_t maxDelayNs {0};
+  int64_t firstQueueNonzeroNs {-1};
+  int64_t firstQueueFullNs {-1};
+  int64_t firstQueueDropNs {-1};
   std::unordered_map<uint64_t, int64_t> pendingTxNs;
 };
 
 static std::map<std::string, LinkDirectionMetrics> g_linkMetrics;
 static std::string g_linkMetricsPath;
 static Time g_linkMetricsInterval = Seconds (1.0);
+static bool g_queueTimeseriesEnabled = false;
+static std::string g_queueTimeseriesPath;
+static Time g_queueTimeseriesInterval = MilliSeconds (10);
 
 static std::string
 CsvEscape (const std::string &value)
@@ -326,10 +372,59 @@ LinkRx (LinkDirectionMetrics *metrics, Ptr<const Packet> packet)
 }
 
 static void
-LinkDrop (LinkDirectionMetrics *metrics, Ptr<const Packet> packet)
+LinkErrorDrop (LinkDirectionMetrics *metrics, Ptr<const Packet> packet)
 {
+  metrics->errorModelDropPackets++;
   metrics->dropPackets++;
   metrics->pendingTxNs.erase (packet->GetUid ());
+}
+
+static void
+QueueEnqueue (LinkDirectionMetrics *metrics, Ptr<const Packet> packet)
+{
+  (void) packet;
+  metrics->queueEnqueuePackets++;
+  metrics->queuePacketsCurrent++;
+  if (metrics->firstQueueNonzeroNs < 0 && metrics->queuePacketsCurrent > 0)
+    {
+      metrics->firstQueueNonzeroNs = Simulator::Now ().GetNanoSeconds ();
+    }
+  if (metrics->firstQueueFullNs < 0 && metrics->queueCapacityPackets > 0 &&
+      metrics->queuePacketsCurrent >= metrics->queueCapacityPackets)
+    {
+      metrics->firstQueueFullNs = Simulator::Now ().GetNanoSeconds ();
+    }
+  metrics->queuePacketsMaximum = std::max (
+      metrics->queuePacketsMaximum, metrics->queuePacketsCurrent);
+  metrics->queuePacketsSum += metrics->queuePacketsCurrent;
+  metrics->queuePacketsSamples++;
+}
+
+static void
+QueueDequeue (LinkDirectionMetrics *metrics, Ptr<const Packet> packet)
+{
+  (void) packet;
+  metrics->queueDequeuePackets++;
+  if (metrics->queuePacketsCurrent > 0)
+    {
+      metrics->queuePacketsCurrent--;
+    }
+  metrics->queuePacketsSum += metrics->queuePacketsCurrent;
+  metrics->queuePacketsSamples++;
+}
+
+static void
+QueueDrop (LinkDirectionMetrics *metrics, Ptr<const Packet> packet)
+{
+  metrics->queueDropPackets++;
+  metrics->dropPackets++;
+  if (metrics->firstQueueDropNs < 0)
+    {
+      metrics->firstQueueDropNs = Simulator::Now ().GetNanoSeconds ();
+    }
+  metrics->pendingTxNs.erase (packet->GetUid ());
+  metrics->queuePacketsSum += metrics->queuePacketsCurrent;
+  metrics->queuePacketsSamples++;
 }
 
 static void
@@ -356,12 +451,22 @@ RegisterLinkDirection (const std::string &key,
   metrics.configuredErrorUnit = configuredErrorUnit;
   sourceDevice->TraceConnectWithoutContext (
       "MacTx", MakeBoundCallback (&LinkTx, &metrics));
-  sourceDevice->TraceConnectWithoutContext (
-      "MacTxDrop", MakeBoundCallback (&LinkDrop, &metrics));
   targetDevice->TraceConnectWithoutContext (
       "MacRx", MakeBoundCallback (&LinkRx, &metrics));
   targetDevice->TraceConnectWithoutContext (
-      "PhyRxDrop", MakeBoundCallback (&LinkDrop, &metrics));
+      "PhyRxDrop", MakeBoundCallback (&LinkErrorDrop, &metrics));
+  Ptr<PointToPointNetDevice> pointToPoint =
+      DynamicCast<PointToPointNetDevice> (sourceDevice);
+  if (pointToPoint != nullptr && pointToPoint->GetQueue () != nullptr)
+    {
+      metrics.queueCapacityPackets = pointToPoint->GetQueue ()->GetMaxSize ().GetValue ();
+      pointToPoint->GetQueue ()->TraceConnectWithoutContext (
+          "Enqueue", MakeBoundCallback (&QueueEnqueue, &metrics));
+      pointToPoint->GetQueue ()->TraceConnectWithoutContext (
+          "Dequeue", MakeBoundCallback (&QueueDequeue, &metrics));
+      pointToPoint->GetQueue ()->TraceConnectWithoutContext (
+          "Drop", MakeBoundCallback (&QueueDrop, &metrics));
+    }
 }
 
 static void
@@ -377,7 +482,13 @@ WriteLinkMetricsSnapshotOnce ()
   output << "simulation_time_s,link,direction,source,target,configured_delay,"
             "configured_data_rate,configured_error_rate,configured_error_unit,"
             "tx_packets,rx_packets,tx_bytes,rx_bytes,"
-            "drop_packets,delay_samples,mean_delay_ms,max_delay_ms,pending_packets\n";
+      "drop_packets,queue_drop_packets,queue_packets_mean,queue_packets_max,"
+            "error_model_drop_packets,queue_enqueue_packets,queue_dequeue_packets,"
+            "queue_capacity_packets,queue_packets_current,queue_samples,"
+            "queue_occupancy_ratio_mean,queue_occupancy_ratio_max,"
+            "first_queue_nonzero_time_s,first_queue_full_time_s,first_queue_drop_time_s,"
+            "delay_samples,mean_delay_ms,"
+            "max_delay_ms,pending_packets\n";
   output << std::fixed << std::setprecision (9);
   const double now = Simulator::Now ().GetSeconds ();
   for (const auto &entry : g_linkMetrics)
@@ -386,12 +497,29 @@ WriteLinkMetricsSnapshotOnce ()
       const double meanDelayMs = m.delaySamples == 0
           ? 0.0
           : static_cast<double> (m.delaySumNs) / static_cast<double> (m.delaySamples) / 1e6;
+      const double meanQueuePackets = m.queuePacketsSamples == 0
+          ? 0.0
+          : static_cast<double> (m.queuePacketsSum) /
+            static_cast<double> (m.queuePacketsSamples);
+      const double meanQueueRatio = m.queueCapacityPackets == 0
+          ? 0.0 : meanQueuePackets / static_cast<double> (m.queueCapacityPackets);
+      const double maxQueueRatio = m.queueCapacityPackets == 0
+          ? 0.0 : static_cast<double> (m.queuePacketsMaximum) /
+            static_cast<double> (m.queueCapacityPackets);
       output << now << ',' << CsvEscape (m.link) << ',' << CsvEscape (m.direction) << ','
              << CsvEscape (m.source) << ',' << CsvEscape (m.target) << ','
              << CsvEscape (m.configuredDelay) << ',' << CsvEscape (m.configuredDataRate) << ','
              << m.configuredErrorRate << ',' << CsvEscape (m.configuredErrorUnit) << ','
              << m.txPackets << ',' << m.rxPackets << ',' << m.txBytes << ',' << m.rxBytes << ','
-             << m.dropPackets << ',' << m.delaySamples << ',' << meanDelayMs << ','
+             << m.dropPackets << ',' << m.queueDropPackets << ',' << meanQueuePackets << ','
+             << m.queuePacketsMaximum << ',' << m.errorModelDropPackets << ','
+             << m.queueEnqueuePackets << ',' << m.queueDequeuePackets << ','
+             << m.queueCapacityPackets << ',' << m.queuePacketsCurrent << ','
+             << m.queuePacketsSamples << ',' << meanQueueRatio << ',' << maxQueueRatio << ','
+             << (m.firstQueueNonzeroNs < 0 ? -1.0 : m.firstQueueNonzeroNs / 1e9) << ','
+             << (m.firstQueueFullNs < 0 ? -1.0 : m.firstQueueFullNs / 1e9) << ','
+             << (m.firstQueueDropNs < 0 ? -1.0 : m.firstQueueDropNs / 1e9) << ','
+             << m.delaySamples << ',' << meanDelayMs << ','
              << static_cast<double> (m.maxDelayNs) / 1e6 << ',' << m.pendingTxNs.size () << '\n';
     }
   output.close ();
@@ -402,6 +530,41 @@ WriteLinkMetricsSnapshotOnce ()
       NS_LOG_UNCOND ("[METRICS][WARN] cannot publish link metrics: " << error.message ());
       std::filesystem::remove (temporary);
     }
+}
+
+static void
+WriteQueueTimeseriesSnapshot ()
+{
+  if (!g_queueTimeseriesEnabled)
+    {
+      return;
+    }
+  const bool newFile = !std::filesystem::exists (g_queueTimeseriesPath);
+  std::ofstream output (g_queueTimeseriesPath, std::ios::out | std::ios::app);
+  if (!output)
+    {
+      NS_LOG_UNCOND ("[METRICS][WARN] cannot open " << g_queueTimeseriesPath);
+      return;
+    }
+  if (newFile)
+    {
+      output << "monotonic_ns,simulation_time_s,link,direction,queue_packets,"
+                "queue_capacity,queue_enqueue_count,queue_dequeue_count,queue_drop_count\n";
+    }
+  const auto monotonicNs = std::chrono::duration_cast<std::chrono::nanoseconds> (
+      std::chrono::steady_clock::now ().time_since_epoch ()).count ();
+  const double now = Simulator::Now ().GetSeconds ();
+  output << std::fixed << std::setprecision (9);
+  for (const auto &entry : g_linkMetrics)
+    {
+      const LinkDirectionMetrics &m = entry.second;
+      output << monotonicNs << ',' << now << ',' << CsvEscape (m.link) << ','
+             << CsvEscape (m.direction) << ',' << m.queuePacketsCurrent << ','
+             << m.queueCapacityPackets << ',' << m.queueEnqueuePackets << ','
+             << m.queueDequeuePackets << ',' << m.queueDropPackets << '\n';
+    }
+  output.close ();
+  Simulator::Schedule (g_queueTimeseriesInterval, &WriteQueueTimeseriesSnapshot);
 }
 
 static void
@@ -420,6 +583,8 @@ def emit_main_begin(
     pcap_dir: Path,
     link_metrics: bool,
     link_metrics_interval: str,
+    queue_timeseries: bool = False,
+    queue_timeseries_interval: str = "10ms",
     random_seed: int | None = None,
     random_run: int = 1,
 ):
@@ -447,6 +612,10 @@ def emit_main_begin(
     if link_metrics:
         lines.append(f"  g_linkMetricsPath = {cpp_string(metrics_dir / 'link-metrics.csv')};")
         lines.append(f"  g_linkMetricsInterval = {time_expr(link_metrics_interval)};")
+        if queue_timeseries:
+            lines.append("  g_queueTimeseriesEnabled = true;")
+            lines.append(f"  g_queueTimeseriesPath = {cpp_string(metrics_dir / 'queue-timeseries.csv')};")
+            lines.append(f"  g_queueTimeseriesInterval = {time_expr(queue_timeseries_interval)};")
     lines.append("")
     lines.append("  CommandLine cmd;")
     lines.append("  cmd.Parse (argc, argv);")
@@ -486,6 +655,7 @@ def emit_backbone_links(
     link_metrics: bool = False,
     pcap_dir: Path | None = None,
     pcap_enabled: bool | None = None,
+    pcap_links: set[str] | None = None,
 ):
     lines = []
     if pcap_enabled is None:
@@ -528,7 +698,8 @@ def emit_backbone_links(
             f'  NetDeviceContainer dev_{lvar} = p2p_{lvar}.Install (nodes["{a}"], nodes["{b}"]);'
         )
 
-        configured_error_rate = 0.0
+        configured_error_rate_a_to_b = 0.0
+        configured_error_rate_b_to_a = 0.0
         configured_error_unit = "packet"
         error_cfg = link.get("error_model")
         if error_cfg is not None:
@@ -541,13 +712,33 @@ def emit_backbone_links(
             if not 0.0 <= error_rate <= 1.0:
                 raise ValueError(f"Backbone link {lname} error_rate must be between 0 and 1")
             unit_expr = _error_unit_expr(str(error_cfg.get("unit", "packet")))
-            configured_error_rate = error_rate
             configured_error_unit = str(error_cfg.get("unit", "packet")).strip().lower()
-            for device_index in (0, 1):
+            raw_direction = str(error_cfg.get("direction", "both")).strip().lower().replace("_", "-")
+            direction_aliases = {
+                "both": (0, 1),
+                "a-to-b": (1,),
+                "b-to-a": (0,),
+                f"{str(a).lower()}-to-{str(b).lower()}": (1,),
+                f"{str(b).lower()}-to-{str(a).lower()}": (0,),
+            }
+            if raw_direction not in direction_aliases:
+                raise ValueError(
+                    f"Unsupported error model direction on {lname}: {raw_direction}"
+                )
+            receive_device_indices = direction_aliases[raw_direction]
+            configured_error_rate_a_to_b = error_rate if 1 in receive_device_indices else 0.0
+            configured_error_rate_b_to_a = error_rate if 0 in receive_device_indices else 0.0
+            stream_base = int(error_cfg.get("stream", 1))
+            if stream_base < 0:
+                raise ValueError(f"error_model.stream must be non-negative on {lname}")
+            for offset, device_index in enumerate(receive_device_indices):
                 error_var = f"error_{lvar}_{device_index}"
                 lines.append(f"  Ptr<RateErrorModel> {error_var} = CreateObject<RateErrorModel> ();")
                 lines.append(f'  {error_var}->SetAttribute ("ErrorRate", DoubleValue ({error_rate:.17g}));')
                 lines.append(f'  {error_var}->SetAttribute ("ErrorUnit", EnumValue ({unit_expr}));')
+                # This ns-3 version exposes deterministic stream assignment as
+                # AssignStreams rather than SetStream on RateErrorModel.
+                lines.append(f"  {error_var}->AssignStreams ({stream_base + offset});")
                 lines.append(
                     f'  dev_{lvar}.Get ({device_index})->SetAttribute '
                     f'("ReceiveErrorModel", PointerValue ({error_var}));'
@@ -559,7 +750,7 @@ def emit_backbone_links(
             f'  AssignIpv4Exact (nodes["{b}"], dev_{lvar}.Get (1), "{ip_b}", "{mask}");'
         )
 
-        if pcap_enabled:
+        if pcap_enabled and (pcap_links is None or lname in pcap_links):
             prefix_dir = pcap_dir or Path.cwd()
             prefix0 = prefix_dir / f"ns3_network-{lname}-0"
             prefix1 = prefix_dir / f"ns3_network-{lname}-1"
@@ -570,13 +761,13 @@ def emit_backbone_links(
             lines.append(
                 f"  RegisterLinkDirection ({cpp_string(lname + ':a-to-b')}, {cpp_string(lname)}, "
                 f'"a-to-b", {cpp_string(a)}, {cpp_string(b)}, {cpp_string(link["delay"])}, '
-                f'{cpp_string(data_rate)}, {configured_error_rate:.17g}, {cpp_string(configured_error_unit)}, '
+                f'{cpp_string(data_rate)}, {configured_error_rate_a_to_b:.17g}, {cpp_string(configured_error_unit)}, '
                 f'dev_{lvar}.Get (0), dev_{lvar}.Get (1));'
             )
             lines.append(
                 f"  RegisterLinkDirection ({cpp_string(lname + ':b-to-a')}, {cpp_string(lname)}, "
                 f'"b-to-a", {cpp_string(b)}, {cpp_string(a)}, {cpp_string(link["delay"])}, '
-                f'{cpp_string(data_rate)}, {configured_error_rate:.17g}, {cpp_string(configured_error_unit)}, '
+                f'{cpp_string(data_rate)}, {configured_error_rate_b_to_a:.17g}, {cpp_string(configured_error_unit)}, '
                 f'dev_{lvar}.Get (1), dev_{lvar}.Get (0));'
             )
 
@@ -589,6 +780,7 @@ def emit_lans(
     *,
     pcap_dir: Path | None = None,
     pcap_enabled: bool | None = None,
+    pcap_links: set[str] | None = None,
 ):
     lines = []
     if pcap_enabled is None:
@@ -678,7 +870,7 @@ def emit_lans(
             lines.append(f'  tap_{lvar}_{ep_var}.SetAttribute ("DeviceName", StringValue ("{tap_name}"));')
             lines.append(f'  tap_{lvar}_{ep_var}.Install (nodes["{endpoint_name}"], dev_{lvar}_{ep_var}_es.Get (0));')
 
-        if pcap_enabled:
+        if pcap_enabled and (pcap_links is None or lname in pcap_links):
             prefix_dir = pcap_dir or Path.cwd()
             router_prefix = prefix_dir / f"ns3_network-{lname}-router"
             switch_prefix = prefix_dir / f"ns3_network-{lname}-switch-r"
@@ -717,6 +909,7 @@ def emit_routing_and_end(
 
     if link_metrics:
         lines.append("  WriteLinkMetricsSnapshot ();")
+        lines.append("  WriteQueueTimeseriesSnapshot ();")
     lines.append("  Simulator::Schedule (MilliSeconds (100), &PollStopFile);")
 
     lines.append('  NS_LOG_UNCOND ("ns3 network started.");')
@@ -759,7 +952,7 @@ def generate_cc(config: dict[str, Any], output_dir: Path | str | None = None):
         experiment = {}
     raw_seed = experiment.get("random_seed", config.get("random_seed"))
     random_seed = int(raw_seed) if raw_seed not in (None, "") else None
-    random_run = int(experiment.get("repetition", 1) or 1)
+    random_run = int(experiment.get("ns3_run", experiment.get("repetition", 1)) or 1)
     pcap_enabled = bool(network_cfg.get("pcap", False) or options["pcap"])
 
     parts = [
@@ -770,6 +963,8 @@ def generate_cc(config: dict[str, Any], output_dir: Path | str | None = None):
             pcap_dir=pcap_dir,
             link_metrics=options["link_metrics"],
             link_metrics_interval=options["interval"],
+            queue_timeseries=options["queue_timeseries"],
+            queue_timeseries_interval=options["queue_interval"],
             random_seed=random_seed,
             random_run=random_run,
         ),
@@ -780,8 +975,14 @@ def generate_cc(config: dict[str, Any], output_dir: Path | str | None = None):
             link_metrics=options["link_metrics"],
             pcap_dir=pcap_dir,
             pcap_enabled=pcap_enabled,
+            pcap_links=options["pcap_links"],
         ),
-        emit_lans(network_cfg, pcap_dir=pcap_dir, pcap_enabled=pcap_enabled),
+        emit_lans(
+            network_cfg,
+            pcap_dir=pcap_dir,
+            pcap_enabled=pcap_enabled,
+            pcap_links=options["pcap_links"],
+        ),
         emit_routing_and_end(
             network_cfg,
             flow_monitor=options["flow_monitor"],

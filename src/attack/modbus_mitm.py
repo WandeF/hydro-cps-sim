@@ -220,7 +220,20 @@ class EventWriter:
         })
         if self.metric_recorder is not None:
             self.metric_recorder.record(
-                {**row, "event": "attack_value_modified"},
+                {
+                    **row,
+                    "timestamp_epoch": row.get("intercept_timestamp_epoch", row.get("timestamp_epoch")),
+                    "monotonic_ns": row.get("intercept_monotonic_ns"),
+                    "event": "attack_frame_intercepted",
+                },
+                default_event="attack_frame_intercepted",
+            )
+            self.metric_recorder.record(
+                {
+                    **row,
+                    "monotonic_ns": row.get("modified_monotonic_ns"),
+                    "event": "attack_value_modified",
+                },
                 default_event="attack_value_modified",
             )
 
@@ -423,6 +436,8 @@ class ModbusMitmProcessor:
         return result
 
     def _patch_read_response(self, frame: bytes, start_addr: int, quantity: int, client_label: str, server_label: str) -> bytes:
+        intercept_epoch = time.time()
+        intercept_monotonic_ns = time.monotonic_ns()
         if len(frame) < 9:
             return frame
         function_code = frame[7]
@@ -454,10 +469,12 @@ class ModbusMitmProcessor:
             data[byte_offset:byte_offset + 2] = int(new_regs[0]).to_bytes(2, "big")
             data[byte_offset + 2:byte_offset + 4] = int(new_regs[1]).to_bytes(2, "big")
             rule.events += 1
-            self._log_event(rule, "response", function_code, int.from_bytes(frame[0:2], "big"), original, modified, client_label, server_label)
+            self._log_event(rule, "response", function_code, int.from_bytes(frame[0:2], "big"), original, modified, client_label, server_label, intercept_epoch, intercept_monotonic_ns)
         return bytes(data)
 
     def _patch_write_multiple_request(self, frame: bytes, state: ConnectionState, client_label: str, server_label: str) -> bytes:
+        intercept_epoch = time.time()
+        intercept_monotonic_ns = time.monotonic_ns()
         if len(frame) < 13:
             return frame
         function_code = frame[7]
@@ -490,7 +507,7 @@ class ModbusMitmProcessor:
             data[byte_offset:byte_offset + 2] = int(new_regs[0]).to_bytes(2, "big")
             data[byte_offset + 2:byte_offset + 4] = int(new_regs[1]).to_bytes(2, "big")
             rule.events += 1
-            self._log_event(rule, "request", function_code, int.from_bytes(frame[0:2], "big"), original, modified, client_label, server_label)
+            self._log_event(rule, "request", function_code, int.from_bytes(frame[0:2], "big"), original, modified, client_label, server_label, intercept_epoch, intercept_monotonic_ns)
         return bytes(data)
 
     def _log_event(
@@ -503,9 +520,16 @@ class ModbusMitmProcessor:
         modified: float,
         client_label: str,
         server_label: str,
+        intercept_epoch: float,
+        intercept_monotonic_ns: int,
     ) -> None:
+        modified_epoch = time.time()
+        modified_monotonic_ns = time.monotonic_ns()
         self.events.write({
-            "timestamp_epoch": f"{time.time():.6f}",
+            "timestamp_epoch": f"{modified_epoch:.9f}",
+            "intercept_timestamp_epoch": f"{intercept_epoch:.9f}",
+            "intercept_monotonic_ns": intercept_monotonic_ns,
+            "modified_monotonic_ns": modified_monotonic_ns,
             "attack": self.attack_name,
             "rule": rule.name,
             "target": self.target,

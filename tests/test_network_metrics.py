@@ -59,8 +59,9 @@ class NetworkMetricsTests(unittest.TestCase):
             path.write_text(
                 "simulation_time_s,link,direction,source,target,configured_delay,configured_data_rate,"
                 "configured_error_rate,configured_error_unit,tx_packets,rx_packets,tx_bytes,rx_bytes,"
-                "drop_packets,delay_samples,mean_delay_ms,max_delay_ms,pending_packets\n"
-                "2.0,r0-r1,a-to-b,r0,r1,20ms,10Mbps,0.01,packet,10,8,1200,1000,2,8,20.1,20.2,0\n",
+                "drop_packets,queue_drop_packets,queue_packets_mean,queue_packets_max,"
+                "queue_packets_current,queue_samples,delay_samples,mean_delay_ms,max_delay_ms,pending_packets\n"
+                "2.0,r0-r1,a-to-b,r0,r1,20ms,10Mbps,0.01,packet,10,8,1200,1000,2,1,2.5,4,0,20,8,20.1,20.2,0\n",
                 encoding="utf-8",
             )
             rows = parse_link_metrics_csv(path)
@@ -74,6 +75,12 @@ class NetworkMetricsTests(unittest.TestCase):
         self.assertAlmostEqual(rows[0]["delay_error_percent"], 0.5)
         self.assertAlmostEqual(rows[0]["loss_error"], 0.19)
         self.assertAlmostEqual(rows[0]["throughput_utilization"], 0.0004)
+        self.assertEqual(rows[0]["queue_drop_packets"], 1)
+        self.assertEqual(rows[0]["error_model_drop_packets"], 1)
+        self.assertEqual(rows[0]["other_classified_losses"], 0)
+        self.assertTrue(rows[0]["network_conservation_ok"])
+        self.assertAlmostEqual(rows[0]["queue_packets_mean"], 2.5)
+        self.assertEqual(rows[0]["queue_packets_max"], 4)
 
     def test_empty_flow_stats_is_reported_not_fabricated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
