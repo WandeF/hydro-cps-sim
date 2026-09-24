@@ -344,15 +344,23 @@ def main() -> int:
             continue
 
         print(f"[OK] {plc_name} interactive server is up in {namespace}")
-        try:
-            resp = send_openplc_command(namespace, f"start_modbus({args.modbus_port})")
-            print(f"[RESP] {plc_name}: {resp if resp else '[no response]'}")
-        except Exception as e:
-            print(f"[ERROR] {plc_name} start_modbus failed: {e}")
-            failed += 1
-            continue
+        modbus_ready = False
+        for attempt in range(1, 4):
+            try:
+                resp = send_openplc_command(namespace, f"start_modbus({args.modbus_port})")
+                print(
+                    f"[RESP] {plc_name} attempt={attempt}: "
+                    f"{resp if resp else '[no response]'}"
+                )
+            except Exception as e:
+                print(f"[WARN] {plc_name} start_modbus attempt={attempt} failed: {e}")
+            if wait_for_modbus(namespace, args.modbus_port, timeout=6.0):
+                modbus_ready = True
+                break
+            if attempt < 3:
+                time.sleep(0.5)
 
-        if wait_for_modbus(namespace, args.modbus_port, timeout=6.0):
+        if modbus_ready:
             print(f"[OK] {plc_name} Modbus is listening on 127.0.0.1:{args.modbus_port}")
         else:
             print(f"[ERROR] {plc_name} Modbus did not listen on 127.0.0.1:{args.modbus_port}")

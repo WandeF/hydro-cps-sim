@@ -1,137 +1,129 @@
-import sys
-import time
-import random
+#!/usr/bin/env python3
+"""Deterministic random data source for communication/control scale tests.
+
+The scale experiment deliberately has no water-network model. This module
+produces one value in ``[minimum, maximum]`` for every source-PLC sensor on
+each iteration. The persistent runtime publishes the values to the local PLC
+adapters, which perform the actual Modbus register writes; SCADA then polls
+the source PLCs and forwards the values to their paired execution PLCs.
+
+Values are derived from ``seed + iteration + tag`` rather than mutable global
+random state. A run is random-looking but exactly reproducible and can be
+audited independently at any iteration.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
 import json
+import math
+import random
+from dataclasses import dataclass
 from pathlib import Path
-
-from pymodbus.client.sync import ModbusTcpClient
-from pymodbus.payload import BinaryPayloadBuilder, Endian
-
-# =====================
-# 配置
-# =====================
-PLC_IP = "127.0.0.1"
-PLC_PORT = 502
-UNIT_ID = 1
-WRITE_INTERVAL = 1.0  # 秒
-
-# OpenPLC:
-# %MD0 -> 2048
-BASE_ADDR = 2048
+from typing import Any
 
 
-def md_to_register(md_index: int) -> int:
-    return BASE_ADDR + md_index * 2
+@dataclass(frozen=True)
+class DataFeedConfig:
+    tags: tuple[str, ...]
+    minimum: float = 0.0
+    maximum: float = 10.0
+    seed: int = 0
+    precision: int = 6
+
+    def __post_init__(self) -> None:
+        if not self.tags:
+            raise ValueError("data feed requires at least one tag")
+        if not math.isfinite(self.minimum) or not math.isfinite(self.maximum):
+            raise ValueError("data-feed bounds must be finite")
+        if self.minimum > self.maximum:
+            raise ValueError("data-feed minimum cannot exceed maximum")
+        if self.precision < 0:
+            raise ValueError("data-feed precision cannot be negative")
 
 
-def load_sensors(file_path: str):
-    path = Path(file_path)
-    if not path.exists():
-        raise FileNotFoundError(f"配置文件不存在: {file_path}")
+class DataFeed:
+    """Generate reproducible per-tag random values for an iteration."""
 
-    with path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
+    def __init__(self, config: DataFeedConfig) -> None:
+        self.config = config
 
-    if not isinstance(data, list):
-        raise ValueError("JSON 顶层必须是 list")
+    @staticmethod
+    def _derived_seed(seed: int, iteration: int, tag: str) -> int:
+        digest = hashlib.sha256(f"{seed}:{iteration}:{tag}".encode("utf-8")).digest()
+        return int.from_bytes(digest[:8], "big", signed=False)
 
-    sensors = []
-    for i, item in enumerate(data):
-        if not isinstance(item, dict):
-            raise ValueError(f"第 {i} 项不是对象: {item}")
-
-        for key in ("name", "md_index", "min_val", "max_val"):
-            if key not in item:
-                raise ValueError(f"第 {i} 项缺少字段 {key}: {item}")
-
-        sensor = {
-            "name": str(item["name"]),
-            "md_index": int(item["md_index"]),
-            "min_val": float(item["min_val"]),
-            "max_val": float(item["max_val"]),
-        }
-
-        if sensor["min_val"] > sensor["max_val"]:
-            raise ValueError(
-                f"{sensor['name']} 的 min_val 不能大于 max_val"
-            )
-
-        sensors.append(sensor)
-
-    sensors.sort(key=lambda x: x["md_index"])
-    return sensors
+    def values(self, iteration: int) -> dict[str, float]:
+        if iteration < 0:
+            raise ValueError("data-feed iteration cannot be negative")
+        result: dict[str, float] = {}
+        for tag in self.config.tags:
+            generator = random.Random(self._derived_seed(self.config.seed, iteration, tag))
+            value = generator.uniform(self.config.minimum, self.config.maximum)
+            result[tag] = round(value, self.config.precision)
+        return result
 
 
-def gen_random_value(name: str, low: float, high: float) -> float:
-    # 反馈量先按 0/1 模拟
-    if name.endswith("F"):
-        return float(random.choice([0, 1]))
-    return round(random.uniform(low, high), 3)
+def source_sensor_tags(raw_config: dict[str, Any]) -> tuple[str, ...]:
+    """Return the unique tags owned by PLCs marked as data-feed sources."""
+    tags: list[str] = []
+    seen: set[str] = set()
+    for plc in raw_config.get("plcs", []) or []:
+        if not isinstance(plc, dict) or plc.get("scale_role") != "source":
+            continue
+        for raw_tag in plc.get("sensors", []) or []:
+            tag = str(raw_tag)
+            if tag and tag not in seen:
+                seen.add(tag)
+                tags.append(tag)
+    return tuple(tags)
 
 
-def main():
-    if len(sys.argv) != 2:
-        print("missing sensors.json")
-        sys.exit(1)
+def from_runtime_config(raw_config: dict[str, Any]) -> DataFeed:
+    physics = raw_config.get("physics", {}) or {}
+    options = physics.get("data_feed", {}) if isinstance(physics, dict) else {}
+    options = options if isinstance(options, dict) else {}
+    experiment = raw_config.get("experiment", {}) or {}
+    seed = options.get("seed", experiment.get("random_seed", 0))
+    return DataFeed(DataFeedConfig(
+        tags=source_sensor_tags(raw_config),
+        minimum=float(options.get("minimum", 0.0)),
+        maximum=float(options.get("maximum", 10.0)),
+        seed=int(seed),
+        precision=int(options.get("precision", 6)),
+    ))
 
-    sensors_file = sys.argv[1]
-    sensors = load_sensors(sensors_file)
 
-    client = ModbusTcpClient(PLC_IP, port=PLC_PORT)
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tags", nargs="+", required=True)
+    parser.add_argument("--iterations", type=int, required=True)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--minimum", type=float, default=0.0)
+    parser.add_argument("--maximum", type=float, default=10.0)
+    parser.add_argument("--precision", type=int, default=6)
+    parser.add_argument("--output", type=Path)
+    return parser
 
-    print(f"[Modbus Writer] Loading sensors from {sensors_file} ...")
-    print(f"[Modbus Writer] Loaded {len(sensors)} sensors.")
-    print(f"[Modbus Writer] Connecting to {PLC_IP}:{PLC_PORT} ...")
 
-    if not client.connect():
-        print("[Modbus Writer] Connection failed.")
-        sys.exit(1)
-
-    print("[Modbus Writer] Connected.")
-
-    try:
-        while True:
-            values = {}
-            builder = BinaryPayloadBuilder(
-                byteorder=Endian.Big,
-                wordorder=Endian.Big
-            )
-
-            for sensor in sensors:
-                name = sensor["name"]
-                md_index = sensor["md_index"]
-                low = sensor["min_val"]
-                high = sensor["max_val"]
-
-                val = gen_random_value(name, low, high)
-                reg_addr = md_to_register(md_index)
-
-                values[name] = (md_index, reg_addr, val)
-                builder.add_32bit_float(val)
-
-            registers = builder.to_registers()
-
-            start_md = sensors[0]["md_index"]
-            start_addr = md_to_register(start_md)
-
-            rr = client.write_registers(start_addr, registers, unit=UNIT_ID)
-
-            if rr.isError():
-                print("[Modbus Writer] Write failed:", rr)
-            else:
-                print("=" * 72)
-                print(f"[Modbus Writer] Batch write success. Start={start_addr}, regs={len(registers)}")
-                for name, (md_index, reg_addr, val) in values.items():
-                    print(f"{name:10s}  %MD{md_index:<2d}  reg={reg_addr:<4d}  value={val:>6.3f}")
-
-            time.sleep(WRITE_INTERVAL)
-
-    except KeyboardInterrupt:
-        print("\n[Modbus Writer] Stopped by user.")
-    finally:
-        client.close()
-        print("[Modbus Writer] Connection closed.")
+def main() -> int:
+    args = _build_parser().parse_args()
+    feed = DataFeed(DataFeedConfig(
+        tags=tuple(args.tags),
+        minimum=args.minimum,
+        maximum=args.maximum,
+        seed=args.seed,
+        precision=args.precision,
+    ))
+    rows = [{"iteration": iteration, **feed.values(iteration)} for iteration in range(args.iterations)]
+    payload = json.dumps(rows, ensure_ascii=False, indent=2) + "\n"
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(payload, encoding="utf-8")
+    else:
+        print(payload, end="")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

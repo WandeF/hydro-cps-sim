@@ -109,7 +109,11 @@ def _condition_expr(var_name: str, typ: str, value: Any) -> str:
         return f"{var_name} < {threshold}"
     if typ == "above":
         return f"{var_name} > {threshold}"
-    raise ValueError(f"Unsupported control type: {typ!r}; expected 'below' or 'above'")
+    if typ in {"above_equal", "above_or_equal", "at_or_above"}:
+        return f"{var_name} >= {threshold}"
+    raise ValueError(
+        f"Unsupported control type: {typ!r}; expected 'below', 'above', or 'above_equal'"
+    )
 
 
 def _dependency_variables(plc: dict[str, Any], sensor_owner: dict[str, str]) -> list[tuple[str, str]]:

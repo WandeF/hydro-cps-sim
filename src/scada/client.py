@@ -20,6 +20,8 @@ from typing import Any, Callable
 from src.io.csv import append_jsonl, append_row, csv_dir, json_dir, raw_dir
 from src.comm.modbus import ModbusEndpoint
 from src.core.config import MdVar, RuntimeConfig, load_runtime_config, read_json, write_json
+from src.metrics import EventLogger, make_event, safe_log
+from src.metrics.modbus_metrics import ModbusMetricsRecorder
 from src.sync.filesystem import DEFAULT_POLL_INTERVAL, marker_path, stop_requested, touch_marker, wait_for_markers
 from src.sync.helics_sync import HelicsSync, coordinator_endpoint, scada_endpoint
 
@@ -127,12 +129,42 @@ def _run_plc_tasks(
         return list(executor.map(worker, plcs))
 
 
-def _get_or_open_endpoint(plc: Any, args: argparse.Namespace, endpoints: dict[str, ModbusEndpoint] | None) -> tuple[ModbusEndpoint, bool]:
+def _get_or_open_endpoint(
+    plc: Any,
+    args: argparse.Namespace,
+    endpoints: dict[str, ModbusEndpoint] | None,
+    *,
+    phase: str,
+) -> tuple[ModbusEndpoint, bool]:
     if endpoints is not None and plc.name in endpoints:
-        return endpoints[plc.name], False
+        mb = endpoints[plc.name]
+        _configure_modbus_observer(mb, args, plc_name=plc.name, phase=phase)
+        return mb, False
     mb = ModbusEndpoint(plc.ip, port=args.port, unit_id=args.unit_id, timeout=args.timeout)
+    _configure_modbus_observer(mb, args, plc_name=plc.name, phase="connect")
     mb.connect()
+    _configure_modbus_observer(mb, args, plc_name=plc.name, phase=phase)
     return mb, True
+
+
+def _configure_modbus_observer(
+    mb: ModbusEndpoint,
+    args: argparse.Namespace,
+    *,
+    plc_name: str,
+    phase: str,
+) -> None:
+    recorder = getattr(args, "_modbus_metrics_recorder", None)
+    if not isinstance(recorder, ModbusMetricsRecorder):
+        mb.set_observer(None)
+        return
+    iteration = int(getattr(args, "_metrics_iteration", -1))
+    mb.set_observer(recorder.observer(
+        iteration=iteration,
+        target=plc_name,
+        phase=phase,
+        warmup=bool(getattr(args, "_timeout_grace_active", False)),
+    ))
 
 
 def _poll_one_plc(
@@ -152,7 +184,7 @@ def _poll_one_plc(
     mb: ModbusEndpoint | None = None
     close_after = False
     try:
-        mb, close_after = _get_or_open_endpoint(plc, args, endpoints)
+        mb, close_after = _get_or_open_endpoint(plc, args, endpoints, phase="poll")
         md_vars = [var for var in plc.md_vars.values() if not (args.skip_ready and var.name == "PLC_Ready")]
         if md_vars:
             if _batch_modbus_enabled(args):
@@ -332,7 +364,7 @@ def _downlink_one_plc(
     timeout_flag = not warmup_timeout
     timeout_label = "warmup timeout" if warmup_timeout else "timeout"
     try:
-        mb, close_after = _get_or_open_endpoint(plc, args, endpoints)
+        mb, close_after = _get_or_open_endpoint(plc, args, endpoints, phase="downlink")
         if _batch_modbus_enabled(args):
             try:
                 mb.write_real_mds({var.md_index: value for var, value, _source in writes})
@@ -708,15 +740,22 @@ def downlink(args: argparse.Namespace) -> int:
 
 def _connect_scada_endpoints(rt: RuntimeConfig, args: argparse.Namespace) -> dict[str, ModbusEndpoint]:
     endpoints: dict[str, ModbusEndpoint] = {}
-    for plc in rt.plcs.values():
-        if not plc.ip:
-            continue
-        mb = ModbusEndpoint(plc.ip, port=args.port, unit_id=args.unit_id, timeout=args.timeout)
-        mb.connect(
-            retries=max(1, int(getattr(args, "connect_retries", 1) or 1)),
-            delay=float(getattr(args, "connect_retry_delay", 0.2) or 0.2),
-        )
-        endpoints[plc.name] = mb
+    try:
+        for plc in rt.plcs.values():
+            if not plc.ip:
+                continue
+            mb = ModbusEndpoint(plc.ip, port=args.port, unit_id=args.unit_id, timeout=args.timeout)
+            _configure_modbus_observer(mb, args, plc_name=plc.name, phase="connect")
+            mb.connect(
+                retries=max(1, int(getattr(args, "connect_retries", 1) or 1)),
+                delay=float(getattr(args, "connect_retry_delay", 0.2) or 0.2),
+            )
+            endpoints[plc.name] = mb
+    except Exception:
+        # Persistent connections are initialized as a group.  If any PLC is
+        # unavailable, release the already-open sockets before retry/exit.
+        _close_scada_endpoints(endpoints)
+        raise
     return endpoints
 
 
@@ -736,6 +775,28 @@ def daemon(args: argparse.Namespace) -> int:
     out_json_dir = json_dir(runtime_dir)
     sync_dir.mkdir(parents=True, exist_ok=True)
 
+    metrics_cfg = rt.raw.get("metrics", {}) or {}
+    metrics_enabled = isinstance(metrics_cfg, dict) and bool(metrics_cfg.get("enabled", False))
+    event_logger: EventLogger | None = None
+    modbus_recorder: ModbusMetricsRecorder | None = None
+    if metrics_enabled and bool(metrics_cfg.get("event_log", True)):
+        try:
+            event_logger = EventLogger(csv_dir(runtime_dir) / "events.csv")
+        except Exception as exc:
+            print(f"[METRICS][WARN] SCADA event metrics disabled: {exc}", flush=True)
+    if metrics_enabled and bool(metrics_cfg.get("communication", True)):
+        try:
+            modbus_recorder = ModbusMetricsRecorder(
+                runtime_dir,
+                event_logger=event_logger,
+                emit_events=False,
+                async_mode=True,
+                source="scada",
+            )
+            args._modbus_metrics_recorder = modbus_recorder
+        except Exception as exc:
+            print(f"[METRICS][WARN] SCADA communication metrics disabled: {exc}", flush=True)
+
     expected_local_markers = [plc.lower_name for plc in rt.plcs.values()]
     max_iterations = args.max_iterations
     end_iteration = None if max_iterations is None else args.start_iteration + max_iterations
@@ -743,19 +804,31 @@ def daemon(args: argparse.Namespace) -> int:
     print(f"[SCADA-DAEMON] start runtime={runtime_dir} sync={sync_dir} plcs={expected_local_markers}", flush=True)
 
     sync: HelicsSync | None = None
-    if args.sync_backend == "helics":
-        sync = HelicsSync.from_args(
-            "hydro_scada",
-            scada_endpoint(args.helics_prefix),
-            args,
-            timeout=args.sync_timeout,
-        ).start()
-        print(f"[SCADA-DAEMON] HELICS endpoint={sync.endpoint}", flush=True)
+    try:
+        if args.sync_backend == "helics":
+            sync = HelicsSync.from_args(
+                "hydro_scada",
+                scada_endpoint(args.helics_prefix),
+                args,
+                timeout=args.sync_timeout,
+            ).start()
+            print(f"[SCADA-DAEMON] HELICS endpoint={sync.endpoint}", flush=True)
+    except Exception:
+        if modbus_recorder is not None:
+            modbus_recorder.close()
+        raise
 
     endpoints: dict[str, ModbusEndpoint] | None = None
-    if not args.no_persistent_scada_connections:
-        endpoints = _connect_scada_endpoints(rt, args)
-        print(f"[SCADA-DAEMON] persistent Modbus connections={len(endpoints)}", flush=True)
+    try:
+        if not args.no_persistent_scada_connections:
+            endpoints = _connect_scada_endpoints(rt, args)
+            print(f"[SCADA-DAEMON] persistent Modbus connections={len(endpoints)}", flush=True)
+    except Exception:
+        if sync is not None:
+            sync.close()
+        if modbus_recorder is not None:
+            modbus_recorder.close()
+        raise
 
     previous_poll: dict[str, dict[str, Any]] = {}
     iteration = args.start_iteration
@@ -766,6 +839,16 @@ def daemon(args: argparse.Namespace) -> int:
             try:
                 cycle_t0 = time.monotonic()
                 timing: dict[str, Any] = {"iteration": iteration}
+                args._metrics_iteration = iteration
+                if event_logger is not None:
+                    safe_log(event_logger, make_event(
+                        iteration=iteration,
+                        layer="control",
+                        component="scada",
+                        event_type="scada_iteration_start",
+                        source="scada",
+                        status="started",
+                    ))
                 grace_end_iteration = args.start_iteration + max(0, int(args.timeout_grace_iterations or 0))
                 args._timeout_grace_active = iteration < grace_end_iteration
 
@@ -836,6 +919,19 @@ def daemon(args: argparse.Namespace) -> int:
                 timing["write_outputs_and_marker_sec"] = time.monotonic() - marker_t0
                 timing["cycle_total_sec"] = time.monotonic() - cycle_t0
                 _write_scada_timing_csv(runtime_dir, timing)
+                if event_logger is not None:
+                    safe_log(event_logger, make_event(
+                        iteration=iteration,
+                        layer="control",
+                        component="scada",
+                        event_type="scada_iteration_end",
+                        source="scada",
+                        status="success",
+                        details={
+                            "cycle_total_sec": timing["cycle_total_sec"],
+                            **_count_scada_payloads(poll_payload, downlink_payload),
+                        },
+                    ))
                 print(
                     f"[SCADA-DAEMON] cycle={iteration} done "
                     f"timing wait={timing['wait_local_write_markers_sec']:.4f}s "
@@ -847,6 +943,16 @@ def daemon(args: argparse.Namespace) -> int:
                 )
                 iteration += 1
             except Exception as exc:
+                if event_logger is not None:
+                    safe_log(event_logger, make_event(
+                        iteration=iteration,
+                        layer="control",
+                        component="scada",
+                        event_type="scada_iteration_error",
+                        source="scada",
+                        status="error",
+                        details={"error": str(exc), "type": type(exc).__name__},
+                    ))
                 err_path = out_json_dir / f"error_{iteration:04d}_scada.json"
                 write_json(err_path, {"iteration": iteration, "error": str(exc), "traceback": traceback.format_exc()})
                 error_signal = {"iteration": iteration, "error": str(exc), "output": str(err_path)}
@@ -867,6 +973,8 @@ def daemon(args: argparse.Namespace) -> int:
         _close_scada_endpoints(endpoints)
         if sync is not None:
             sync.close()
+        if modbus_recorder is not None:
+            modbus_recorder.close()
 
     print(f"[SCADA-DAEMON] stop last_iteration={iteration}", flush=True)
     return 0

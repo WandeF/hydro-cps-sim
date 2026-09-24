@@ -17,12 +17,14 @@ import ipaddress
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
 from src.core.config import load_runtime_config, load_yaml
 from src.io.csv import append_jsonl, raw_dir
+from src.metrics.attack_metrics import AttackMetricRecorder
 
 
 SUPPORTED_MITM_TYPES = {"mitm", "modbus_mitm"}
@@ -156,6 +158,10 @@ def _write_schedule_event(runtime_dir: Path, row: dict[str, Any]) -> None:
         "proxy_pid": row.get("proxy_pid"),
         "message": row.get("message"),
     })
+    AttackMetricRecorder(runtime_dir).record(
+        {**row, "event": f"attack_schedule_{action or 'event'}"},
+        default_event="attack_schedule",
+    )
 
 
 def _write_control_state(
@@ -367,28 +373,57 @@ def _iptables_add_once(scada_ns: str, target_ip: str, target_port: int, attacker
 
 def _iptables_delete_all(scada_ns: str, target_ip: str, target_port: int, attacker_ip: str, listen_port: int) -> None:
     # Try several times because duplicate rules may exist after aborted debug runs.
-    for _ in range(8):
-        try:
-            rc = subprocess.run(
-                _iptables_delete_rule(scada_ns, target_ip, target_port, attacker_ip, listen_port),
-                text=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            ).returncode
-        except FileNotFoundError:
-            rc = 127
-        if rc != 0:
-            break
+    cmd = _iptables_delete_rule(scada_ns, target_ip, target_port, attacker_ip, listen_port)
+    for _ in range(64):
+        result = subprocess.run(cmd, text=True, capture_output=True)
+        if result.returncode == 0:
+            continue
+        # ``iptables -D`` returns 1 when the exact rule is absent.  Treat that
+        # as idempotent success without depending on localized stderr text.
+        if result.returncode == 1:
+            return
+        raise subprocess.CalledProcessError(
+            result.returncode,
+            cmd,
+            output=result.stdout,
+            stderr=result.stderr,
+        )
+    raise RuntimeError("refusing to delete more than 64 duplicate attack DNAT rules")
 
 
-def _stop_pid(pid: int) -> None:
+def _raise_cleanup_errors(context: str, errors: list[Exception]) -> None:
+    if not errors:
+        return
+    detail = "; ".join(f"{type(exc).__name__}: {exc}" for exc in errors)
+    raise RuntimeError(f"{context} cleanup failed: {detail}") from errors[0]
+
+
+def _stop_pid(pid: int, *, grace: float = 3.0, poll_interval: float = 0.05) -> None:
+    """Terminate a process group after allowing metric writers to flush.
+
+    MITM's writer has a bounded two-second close deadline.  The previous fixed
+    0.2-second delay almost always escalated to SIGKILL first, losing its final
+    quality snapshot.  Polling keeps shutdown bounded while preserving the
+    graceful path.
+    """
+
     try:
         os.killpg(pid, signal.SIGTERM)
     except ProcessLookupError:
         return
     except PermissionError:
         os.kill(pid, signal.SIGTERM)
-    time.sleep(0.2)
+
+    deadline = time.monotonic() + max(0.0, float(grace))
+    interval = max(0.001, float(poll_interval))
+    while _is_pid_alive(pid):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(interval, remaining))
+    if not _is_pid_alive(pid):
+        return
+
     try:
         os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -414,25 +449,32 @@ def _stop_target(
     reason: str = "stop",
 ) -> bool:
     name = str(scenario.get("name"))
-    _iptables_delete_all(scada_ns, target_ip, target_port, attacker_ip, listen_port)
+    errors: list[Exception] = []
+    try:
+        _iptables_delete_all(scada_ns, target_ip, target_port, attacker_ip, listen_port)
+    except Exception as exc:
+        errors.append(exc)
     pid = _running_pid(runtime_dir, name, target_key)
     pf = _pid_file(runtime_dir, name, target_key)
     stopped = False
     if pid is not None:
-        _stop_pid(pid)
-        stopped = True
+        try:
+            _stop_pid(pid)
+            stopped = True
+        except Exception as exc:
+            errors.append(exc)
     try:
         pf.unlink()
     except FileNotFoundError:
         pass
-    except Exception:
-        pass
+    except Exception as exc:
+        errors.append(exc)
     try:
         _state_file(runtime_dir, name, target_key).unlink()
     except FileNotFoundError:
         pass
-    except Exception:
-        pass
+    except Exception as exc:
+        errors.append(exc)
     if stopped:
         _write_schedule_event(runtime_dir, {
             "timestamp_epoch": f"{time.time():.6f}",
@@ -444,6 +486,7 @@ def _stop_target(
             "proxy_pid": pid,
             "message": reason,
         })
+    _raise_cleanup_errors(f"MITM attack {name}/{target_key}", errors)
     return stopped
 
 
@@ -704,6 +747,7 @@ def _run_openplc_restore(
     args: argparse.Namespace,
     runtime_dir: Path,
     spec: dict[str, Any],
+    iteration: int | None = None,
 ) -> None:
     project_root = Path(__file__).resolve().parents[2]
     cmd = [
@@ -717,6 +761,7 @@ def _run_openplc_restore(
         "--state-file", str(spec["state_file"]),
         "--backup-file", str(spec["backup_file"]),
         "--injection-json", json.dumps(spec["injection"], sort_keys=True),
+        "--iteration", str(-1 if iteration is None else iteration),
         "--action", "restore",
     ]
     print("[ATTACK] restore", " ".join(cmd), flush=True)
@@ -735,32 +780,46 @@ def _stop_openplc_logic(
     name = spec["name"]
     pid_key = spec["pid_key"]
     pid = _running_pid(runtime_dir, name, pid_key)
+    errors: list[Exception] = []
     restored = False
+    stopped = False
     if pid is not None:
         if spec.get("restore_on_stop", True):
-            _run_openplc_restore(args=args, runtime_dir=runtime_dir, spec=spec)
-            restored = True
+            try:
+                _run_openplc_restore(args=args, runtime_dir=runtime_dir, spec=spec, iteration=iteration)
+                restored = True
+            except Exception as exc:
+                errors.append(exc)
         try:
             os.killpg(pid, signal.SIGKILL)
+            stopped = True
         except ProcessLookupError:
-            pass
+            stopped = True
         except PermissionError:
             try:
                 os.kill(pid, signal.SIGKILL)
+                stopped = True
             except ProcessLookupError:
-                pass
+                stopped = True
+            except Exception as exc:
+                errors.append(exc)
+        except Exception as exc:
+            errors.append(exc)
     elif spec.get("restore_on_stop", True) and Path(spec["state_file"]).exists():
-        state = json.loads(Path(spec["state_file"]).read_text(encoding="utf-8"))
-        if bool(state.get("active", False)):
-            _run_openplc_restore(args=args, runtime_dir=runtime_dir, spec=spec)
-            restored = True
+        try:
+            state = json.loads(Path(spec["state_file"]).read_text(encoding="utf-8"))
+            if bool(state.get("active", False)):
+                _run_openplc_restore(args=args, runtime_dir=runtime_dir, spec=spec, iteration=iteration)
+                restored = True
+        except Exception as exc:
+            errors.append(exc)
 
     try:
         _pid_file(runtime_dir, name, pid_key).unlink()
     except FileNotFoundError:
         pass
-    except Exception:
-        pass
+    except Exception as exc:
+        errors.append(exc)
 
     if restored:
         _write_schedule_event(runtime_dir, {
@@ -773,7 +832,8 @@ def _stop_openplc_logic(
             "proxy_pid": pid or "",
             "message": reason,
         })
-    return restored
+    _raise_cleanup_errors(f"OpenPLC logic attack {name}/{spec['target']}", errors)
+    return restored or stopped
 
 
 def _start_openplc_logic(
@@ -797,7 +857,7 @@ def _start_openplc_logic(
         except Exception:
             state = {}
         if isinstance(state, dict) and bool(state.get("active", False)) and spec.get("restore_on_stop", True):
-            _run_openplc_restore(args=args, runtime_dir=runtime_dir, spec=spec)
+            _run_openplc_restore(args=args, runtime_dir=runtime_dir, spec=spec, iteration=iteration)
 
     project_root = Path(__file__).resolve().parents[2]
     logs_dir = runtime_dir / "logs"
@@ -815,6 +875,7 @@ def _start_openplc_logic(
         "--state-file", str(spec["state_file"]),
         "--backup-file", str(spec["backup_file"]),
         "--injection-json", json.dumps(spec["injection"], sort_keys=True),
+        "--iteration", str(-1 if iteration is None else iteration),
     ]
     if spec.get("restore_on_stop", True):
         cmd.append("--restore-on-stop")
@@ -855,16 +916,20 @@ def _stop_dos(
     pid_key = spec["pid_key"]
     pid = _running_pid(runtime_dir, name, pid_key)
     pf = _pid_file(runtime_dir, name, pid_key)
+    errors: list[Exception] = []
     stopped = False
     if pid is not None:
-        _stop_pid(pid)
-        stopped = True
+        try:
+            _stop_pid(pid)
+            stopped = True
+        except Exception as exc:
+            errors.append(exc)
     try:
         pf.unlink()
     except FileNotFoundError:
         pass
-    except Exception:
-        pass
+    except Exception as exc:
+        errors.append(exc)
     if stopped:
         _write_schedule_event(runtime_dir, {
             "timestamp_epoch": f"{time.time():.6f}",
@@ -876,6 +941,7 @@ def _stop_dos(
             "proxy_pid": pid,
             "message": reason,
         })
+    _raise_cleanup_errors(f"DoS attack {name}/{spec['target']}", errors)
     return stopped
 
 
@@ -912,6 +978,7 @@ def _start_dos(
         "--packet-size", str(spec["packet_size"]),
         "--runtime-dir", str(runtime_dir),
         "--start-after-sec", str(spec["start_after_sec"]),
+        "--iteration", str(-1 if iteration is None else iteration),
     ]
     print("[ATTACK] launch", " ".join(cmd), flush=True)
     proc = subprocess.Popen(cmd, cwd=str(project_root), stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True)
@@ -941,27 +1008,42 @@ def stop(args: argparse.Namespace) -> int:
     runtime_dir = args.runtime_dir or (rt.output_dir / "runtime")
 
     count = 0
+    errors: list[str] = []
     for scenario, _idx, target_key, scada_ns, attacker_ip, target_ip, target_port, listen_port in _iter_mitm_targets(cfg, rt, runtime_dir):
-        if _stop_target(
-            runtime_dir=runtime_dir,
-            scada_ns=scada_ns,
-            scenario=scenario,
-            target_key=target_key,
-            target_ip=target_ip,
-            target_port=target_port,
-            attacker_ip=attacker_ip,
-            listen_port=listen_port,
-            reason="stop all",
-        ):
-            count += 1
+        try:
+            if _stop_target(
+                runtime_dir=runtime_dir,
+                scada_ns=scada_ns,
+                scenario=scenario,
+                target_key=target_key,
+                target_ip=target_ip,
+                target_port=target_port,
+                attacker_ip=attacker_ip,
+                listen_port=listen_port,
+                reason="stop all",
+            ):
+                count += 1
+        except Exception as exc:
+            errors.append(f"MITM {scenario.get('name')}/{target_key}: {type(exc).__name__}: {exc}")
     for scenario, spec in _iter_dos_targets(cfg, rt):
-        if _stop_dos(runtime_dir=runtime_dir, scenario=scenario, spec=spec, reason="stop all"):
-            count += 1
+        try:
+            if _stop_dos(runtime_dir=runtime_dir, scenario=scenario, spec=spec, reason="stop all"):
+                count += 1
+        except Exception as exc:
+            errors.append(f"DoS {scenario.get('name')}/{spec.get('target')}: {type(exc).__name__}: {exc}")
     for scenario, spec in _iter_openplc_targets(cfg, rt, runtime_dir):
-        if _stop_openplc_logic(args=args, runtime_dir=runtime_dir, scenario=scenario, spec=spec, reason="stop all"):
-            count += 1
-    print(f"[ATTACK] stopped configured attack components count={count}", flush=True)
-    return 0
+        try:
+            if _stop_openplc_logic(args=args, runtime_dir=runtime_dir, scenario=scenario, spec=spec, reason="stop all"):
+                count += 1
+        except Exception as exc:
+            errors.append(f"OpenPLC {scenario.get('name')}/{spec.get('target')}: {type(exc).__name__}: {exc}")
+    for error in errors:
+        print(f"[ATTACK][ERROR] {error}", file=sys.stderr, flush=True)
+    print(
+        f"[ATTACK] stopped configured attack components count={count} errors={len(errors)}",
+        flush=True,
+    )
+    return 1 if errors else 0
 
 
 def start(args: argparse.Namespace) -> int:
@@ -975,7 +1057,8 @@ def start(args: argparse.Namespace) -> int:
 
     # Manual start keeps the original behavior: clear stale state, then start every
     # enabled scenario regardless of iteration trigger.
-    stop(args)
+    if stop(args) != 0:
+        raise RuntimeError("could not clean existing attack components before start")
 
     scada_ns = _scada_namespace(cfg)
     launched = 0

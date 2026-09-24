@@ -13,6 +13,7 @@ import argparse
 import csv
 import json
 import os
+import queue
 import signal
 import socket
 import struct
@@ -23,7 +24,9 @@ from pathlib import Path
 from typing import Any
 
 from src.core.config import load_runtime_config, load_yaml
-from src.io.csv import append_jsonl, raw_dir
+from src.io.csv import append_jsonl
+from src.metrics.attack_metrics import AttackMetricRecorder
+from src.sync.filesystem import atomic_write_json
 
 BASE_MD_REGISTER = 2048
 
@@ -98,11 +101,39 @@ class ConnectionState:
 
 
 class EventWriter:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, queue_capacity: int = 4096):
         self.path = path
-        self.raw_path = raw_dir(path.parent.parent) / "attack_events.jsonl"
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.lock = threading.Lock()
+        self.runtime_dir = path.parent.parent
+        self.raw_path = self.runtime_dir / "raw" / "attack_events.jsonl"
+        self.stats_path = (
+            self.runtime_dir
+            / "raw"
+            / "metric_writer_stats"
+            / f"mitm-{os.getpid()}.json"
+        )
+        if int(queue_capacity) <= 0:
+            raise ValueError("queue_capacity must be positive")
+        self.queue_capacity = int(queue_capacity)
+        self._queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=self.queue_capacity)
+        self._stop = threading.Event()
+        self._queue_full_notice = threading.Event()
+        self._payload_notice = threading.Event()
+        self._state_lock = threading.Lock()
+        self._accepting = True
+        self._closed = False
+        self._warning_kinds: set[str] = set()
+        self._stats = {
+            "accepted": 0,
+            "processed": 0,
+            "written": 0,
+            "write_errors": 0,
+            "dropped_queue_full": 0,
+            "dropped_after_close": 0,
+            "dropped_disabled": 0,
+            "unflushed_on_close": 0,
+        }
+        self._enabled = True
+        self.metric_recorder: AttackMetricRecorder | None = None
         self.columns = [
             "timestamp_epoch",
             "attack",
@@ -120,32 +151,174 @@ class EventWriter:
             "client",
             "server",
         ]
-        if not self.path.exists() or self.path.stat().st_size == 0:
-            with self.path.open("w", newline="", encoding="utf-8") as f:
-                csv.DictWriter(f, fieldnames=self.columns).writeheader()
+        try:
+            self.metric_recorder = AttackMetricRecorder(self.runtime_dir)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if not self.path.exists() or self.path.stat().st_size == 0:
+                with self.path.open("w", newline="", encoding="utf-8") as f:
+                    csv.DictWriter(f, fieldnames=self.columns).writeheader()
+        except Exception as exc:
+            self._enabled = False
+            self._accepting = False
+            print(f"[MITM][METRICS][WARN] attack event logging disabled: {exc}", flush=True)
+        self._thread: threading.Thread | None = None
+        if self._enabled:
+            self._thread = threading.Thread(target=self._run, name="mitm-event-writer", daemon=True)
+            self._thread.start()
 
-    def write(self, row: dict[str, Any]) -> None:
-        with self.lock:
-            with self.path.open("a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=self.columns, extrasaction="ignore")
-                writer.writerow(row)
-            append_jsonl(self.raw_path, {
-                "timestamp_epoch": row.get("timestamp_epoch"),
-                "iteration": row.get("iteration"),
-                "scenario": row.get("attack"),
-                "rule": row.get("rule"),
-                "target": row.get("target"),
-                "variable": row.get("variable"),
-                "direction": row.get("direction"),
-                "function_code": row.get("function_code"),
-                "transaction_id": row.get("transaction_id"),
-                "old_value": row.get("original_value"),
-                "new_value": row.get("modified_value"),
-                "md_index": row.get("md_index"),
-                "register": row.get("register"),
-                "client": row.get("client"),
-                "server": row.get("server"),
+    def _warn_once(self, kind: str, message: str) -> None:
+        if kind in self._warning_kinds:
+            return
+        self._warning_kinds.add(kind)
+        print(message, flush=True)
+
+    def write(self, row: dict[str, Any]) -> bool:
+        """Queue telemetry without blocking or failing the packet-forwarding path."""
+        try:
+            item = dict(row)
+        except Exception:
+            with self._state_lock:
+                self._stats["dropped_disabled"] += 1
+            self._payload_notice.set()
+            return False
+        with self._state_lock:
+            if not self._enabled:
+                self._stats["dropped_disabled"] += 1
+                return False
+            if not self._accepting:
+                self._stats["dropped_after_close"] += 1
+                return False
+            try:
+                self._queue.put_nowait(item)
+            except queue.Full:
+                self._stats["dropped_queue_full"] += 1
+                self._queue_full_notice.set()
+                return False
+            self._stats["accepted"] += 1
+            return True
+
+    def _write_sync(self, row: dict[str, Any]) -> None:
+        with self.path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=self.columns, extrasaction="ignore")
+            writer.writerow(row)
+        append_jsonl(self.raw_path, {
+            "timestamp_epoch": row.get("timestamp_epoch"),
+            "iteration": row.get("iteration"),
+            "scenario": row.get("attack"),
+            "rule": row.get("rule"),
+            "target": row.get("target"),
+            "variable": row.get("variable"),
+            "direction": row.get("direction"),
+            "function_code": row.get("function_code"),
+            "transaction_id": row.get("transaction_id"),
+            "old_value": row.get("original_value"),
+            "new_value": row.get("modified_value"),
+            "md_index": row.get("md_index"),
+            "register": row.get("register"),
+            "client": row.get("client"),
+            "server": row.get("server"),
+        })
+        if self.metric_recorder is not None:
+            self.metric_recorder.record(
+                {
+                    **row,
+                    "timestamp_epoch": row.get("intercept_timestamp_epoch", row.get("timestamp_epoch")),
+                    "monotonic_ns": row.get("intercept_monotonic_ns"),
+                    "event": "attack_frame_intercepted",
+                },
+                default_event="attack_frame_intercepted",
+            )
+            self.metric_recorder.record(
+                {
+                    **row,
+                    "monotonic_ns": row.get("modified_monotonic_ns"),
+                    "event": "attack_value_modified",
+                },
+                default_event="attack_value_modified",
+            )
+
+    def _run(self) -> None:
+        while True:
+            if self._queue_full_notice.is_set():
+                self._queue_full_notice.clear()
+                self._warn_once(
+                    "queue_full",
+                    "[MITM][METRICS][WARN] event queue is full; telemetry was "
+                    "dropped without blocking packet forwarding",
+                )
+            if self._payload_notice.is_set():
+                self._payload_notice.clear()
+                self._warn_once(
+                    "payload",
+                    "[MITM][METRICS][WARN] invalid attack metric payload was dropped",
+                )
+            if self._stop.is_set() and self._queue.empty():
+                return
+            try:
+                row = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self._write_sync(row)
+            except Exception as exc:
+                with self._state_lock:
+                    self._stats["write_errors"] += 1
+                self._warn_once(
+                    "write_error",
+                    f"[MITM][METRICS][WARN] attack event write failed: {exc}",
+                )
+            else:
+                with self._state_lock:
+                    self._stats["written"] += 1
+            finally:
+                with self._state_lock:
+                    self._stats["processed"] += 1
+                self._queue.task_done()
+
+    def close(self, timeout: float = 2.0) -> None:
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._accepting = False
+        self._stop.set()
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout=max(0.0, float(timeout)))
+        with self._state_lock:
+            outstanding = max(0, self._stats["accepted"] - self._stats["processed"])
+            self._stats["unflushed_on_close"] = outstanding
+        if outstanding:
+            self._warn_once(
+                "close_timeout",
+                f"[MITM][METRICS][WARN] event writer closed with "
+                f"{outstanding} accepted record(s) not flushed",
+            )
+        self._write_stats()
+        if self._thread is not None and not self._thread.is_alive():
+            self._thread = None
+
+    @property
+    def stats(self) -> dict[str, int | bool]:
+        with self._state_lock:
+            snapshot: dict[str, int | bool] = dict(self._stats)
+        snapshot["enabled"] = self._enabled
+        snapshot["queue_capacity"] = self.queue_capacity
+        snapshot["pending"] = self._queue.qsize()
+        snapshot["thread_alive"] = bool(self._thread and self._thread.is_alive())
+        return snapshot
+
+    def _write_stats(self) -> None:
+        try:
+            atomic_write_json(self.stats_path, {
+                "writer": "mitm",
+                "timestamp_epoch": time.time(),
+                **self.stats,
             })
+        except Exception as exc:
+            self._warn_once(
+                "stats_error",
+                f"[MITM][METRICS][WARN] event writer stats write failed: {exc}",
+            )
 
 
 class AttackStateReader:
@@ -263,6 +436,8 @@ class ModbusMitmProcessor:
         return result
 
     def _patch_read_response(self, frame: bytes, start_addr: int, quantity: int, client_label: str, server_label: str) -> bytes:
+        intercept_epoch = time.time()
+        intercept_monotonic_ns = time.monotonic_ns()
         if len(frame) < 9:
             return frame
         function_code = frame[7]
@@ -294,10 +469,12 @@ class ModbusMitmProcessor:
             data[byte_offset:byte_offset + 2] = int(new_regs[0]).to_bytes(2, "big")
             data[byte_offset + 2:byte_offset + 4] = int(new_regs[1]).to_bytes(2, "big")
             rule.events += 1
-            self._log_event(rule, "response", function_code, int.from_bytes(frame[0:2], "big"), original, modified, client_label, server_label)
+            self._log_event(rule, "response", function_code, int.from_bytes(frame[0:2], "big"), original, modified, client_label, server_label, intercept_epoch, intercept_monotonic_ns)
         return bytes(data)
 
     def _patch_write_multiple_request(self, frame: bytes, state: ConnectionState, client_label: str, server_label: str) -> bytes:
+        intercept_epoch = time.time()
+        intercept_monotonic_ns = time.monotonic_ns()
         if len(frame) < 13:
             return frame
         function_code = frame[7]
@@ -330,7 +507,7 @@ class ModbusMitmProcessor:
             data[byte_offset:byte_offset + 2] = int(new_regs[0]).to_bytes(2, "big")
             data[byte_offset + 2:byte_offset + 4] = int(new_regs[1]).to_bytes(2, "big")
             rule.events += 1
-            self._log_event(rule, "request", function_code, int.from_bytes(frame[0:2], "big"), original, modified, client_label, server_label)
+            self._log_event(rule, "request", function_code, int.from_bytes(frame[0:2], "big"), original, modified, client_label, server_label, intercept_epoch, intercept_monotonic_ns)
         return bytes(data)
 
     def _log_event(
@@ -343,9 +520,16 @@ class ModbusMitmProcessor:
         modified: float,
         client_label: str,
         server_label: str,
+        intercept_epoch: float,
+        intercept_monotonic_ns: int,
     ) -> None:
+        modified_epoch = time.time()
+        modified_monotonic_ns = time.monotonic_ns()
         self.events.write({
-            "timestamp_epoch": f"{time.time():.6f}",
+            "timestamp_epoch": f"{modified_epoch:.9f}",
+            "intercept_timestamp_epoch": f"{intercept_epoch:.9f}",
+            "intercept_monotonic_ns": intercept_monotonic_ns,
+            "modified_monotonic_ns": modified_monotonic_ns,
             "attack": self.attack_name,
             "rule": rule.name,
             "target": self.target,
@@ -572,6 +756,7 @@ def main() -> int:
         server.serve_forever()
     finally:
         server.close()
+        events.close()
     return 0
 
 
