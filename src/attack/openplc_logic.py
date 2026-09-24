@@ -22,8 +22,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+from src.comm.modbus import ModbusEndpoint
 from src.control.plc_precompile import copy_binary_atomic, resolve_openplc_root
-from src.core.config import load_runtime_config, load_yaml
+from src.core.config import PlcRuntime, load_runtime_config, load_yaml
 from src.io.csv import append_jsonl, append_row, raw_dir
 from src.metrics.attack_metrics import AttackMetricRecorder
 
@@ -267,6 +268,50 @@ def _start_modbus_with_retry(namespace: str, port: int, *, timeout: float = 30.0
     raise RuntimeError(f"OpenPLC Modbus/TCP did not listen on 127.0.0.1:{port}; last_error={last_error}")
 
 
+def _snapshot_runtime_memory(plc: PlcRuntime, *, port: int = 502, timeout: float = 2.0) -> dict[str, dict[int, Any]]:
+    """Capture PLC inputs and hysteresis outputs before replacing its process.
+
+    A newly launched OpenPLC process starts every %MD and %QX location at zero.
+    For hysteresis programs that is not a neutral state: a dependency such as
+    T7=0 can execute a low-level branch before SCADA reconnects and writes the
+    current process value.  Preserve both register inputs and output coils so a
+    logic-only attack changes the program condition, not the controller memory.
+
+    The attack helper itself runs inside the target PLC namespace, therefore
+    127.0.0.1 addresses the target runtime rather than the host namespace.
+    """
+    with ModbusEndpoint("127.0.0.1", port=port, timeout=timeout) as mb:
+        md_values = mb.read_real_mds(var.md_index for var in plc.md_vars.values())
+        coil_values = mb.read_coils(var.coil_index for var in plc.coil_vars.values())
+    return {"md": md_values, "coils": coil_values}
+
+
+def _restore_runtime_memory(
+    plc: PlcRuntime,
+    snapshot: dict[str, dict[int, Any]],
+    *,
+    port: int = 502,
+    timeout: float = 2.0,
+) -> None:
+    """Hand the previous PLC memory to a freshly started OpenPLC runtime.
+
+    Coils are written both before and after the input registers.  The first
+    write minimizes the cold-start window; the second removes any hysteresis
+    output produced while the registers were still zero.  Once the preserved
+    inputs are present, the newly compiled logic is free to change an output if
+    its modified condition is genuinely true.
+    """
+    md_values = {int(index): float(value) for index, value in (snapshot.get("md") or {}).items()}
+    coil_values = {int(index): bool(value) for index, value in (snapshot.get("coils") or {}).items()}
+    with ModbusEndpoint("127.0.0.1", port=port, timeout=timeout) as mb:
+        if coil_values:
+            mb.write_coils_values(coil_values)
+        if md_values:
+            mb.write_real_mds(md_values)
+        if coil_values:
+            mb.write_coils_values(coil_values)
+
+
 def _bool_literal(raw: Any) -> str:
     value = str(raw).strip().lower()
     if value in {"open", "opened", "true", "on", "1", "yes"}:
@@ -419,7 +464,14 @@ def _compile_one(config_path: Path, target: str, *, compile_log: Path | None = N
     copy_binary_atomic(built_binary, binary_path)
 
 
-def _restart_runtime(config_path: Path, runtime_dir: Path, target: str, namespace: str) -> int:
+def _restart_runtime(
+    config_path: Path,
+    runtime_dir: Path,
+    target: str,
+    namespace: str,
+    *,
+    memory_snapshot: dict[str, dict[int, Any]] | None = None,
+) -> int:
     rt = load_runtime_config(config_path)
     output_dir = rt.output_dir
     binary_path = output_dir / "plcs" / target.lower()
@@ -436,6 +488,8 @@ def _restart_runtime(config_path: Path, runtime_dir: Path, target: str, namespac
     if not _wait_for_port(namespace, "127.0.0.1", 43628, timeout=20.0):
         raise RuntimeError(f"{target.lower()} in {namespace} did not open OpenPLC interactive server")
     _start_modbus_with_retry(namespace, 502, timeout=30.0)
+    if memory_snapshot is not None:
+        _restore_runtime_memory(rt.plcs[target], memory_snapshot)
     return proc.pid
 
 
@@ -462,6 +516,13 @@ def apply_injection(args: argparse.Namespace) -> int:
     binary_path = rt.output_dir / "plcs" / target.lower()
     before_source_hash = _sha256(plc.st_path)
     before_binary_hash = _sha256(binary_path) if binary_path.is_file() else ""
+    memory_snapshot = _snapshot_runtime_memory(plc)
+    _write_event(
+        events,
+        args,
+        "openplc_state_snapshot",
+        f"captured {len(memory_snapshot['md'])} MD values and {len(memory_snapshot['coils'])} coils from {target}",
+    )
     if not backup_path.exists():
         shutil.copy2(plc.st_path, backup_path)
     injected, message = inject_logic(original, target, args.injection)
@@ -477,7 +538,19 @@ def apply_injection(args: argparse.Namespace) -> int:
         _write_event(events, args, "openplc_compile_end", f"compiled malicious {target}")
         after_binary_hash = _sha256(binary_path)
         _write_event(events, args, "openplc_deploy_start", f"deploy malicious {target}")
-        plc_pid = _restart_runtime(args.config, args.runtime_dir, target, args.namespace)
+        plc_pid = _restart_runtime(
+            args.config,
+            args.runtime_dir,
+            target,
+            args.namespace,
+            memory_snapshot=memory_snapshot,
+        )
+        _write_event(
+            events,
+            args,
+            "openplc_state_handoff",
+            f"restored {len(memory_snapshot['md'])} MD values and {len(memory_snapshot['coils'])} coils into {target}",
+        )
         _append_log(
             deploy_log,
             f"deployed malicious binary target={target} namespace={args.namespace} pid={plc_pid} "
@@ -487,7 +560,13 @@ def apply_injection(args: argparse.Namespace) -> int:
         shutil.copy2(backup_path, plc.st_path)
         try:
             _compile_one(args.config, target, compile_log=compile_log)
-            _restart_runtime(args.config, args.runtime_dir, target, args.namespace)
+            _restart_runtime(
+                args.config,
+                args.runtime_dir,
+                target,
+                args.namespace,
+                memory_snapshot=memory_snapshot,
+            )
         except Exception as rollback_exc:
             print(f"[OPENPLC-LOGIC] rollback failed: {rollback_exc}", file=sys.stderr, flush=True)
         raise
@@ -509,6 +588,8 @@ def apply_injection(args: argparse.Namespace) -> int:
             "before_executable_sha256": before_binary_hash,
             "after_executable_sha256": after_binary_hash,
             "malicious_logic_deployed": True,
+            "memory_handoff_md_count": len(memory_snapshot["md"]),
+            "memory_handoff_coil_count": len(memory_snapshot["coils"]),
             "restore_on_stop": bool(args.restore_on_stop),
             "updated_epoch": time.time(),
             "plc_pid": plc_pid,
@@ -537,9 +618,28 @@ def restore_logic(args: argparse.Namespace) -> int:
     if not backup_path.exists():
         _write_event(events, args, "openplc_logic_restore_skip", f"backup not found: {backup_path}")
         return 0
+    memory_snapshot = _snapshot_runtime_memory(plc)
+    _write_event(
+        events,
+        args,
+        "openplc_state_snapshot",
+        f"captured {len(memory_snapshot['md'])} MD values and {len(memory_snapshot['coils'])} coils before restoring {target}",
+    )
     shutil.copy2(backup_path, plc.st_path)
     _compile_one(args.config, target, compile_log=compile_log)
-    plc_pid = _restart_runtime(args.config, args.runtime_dir, target, args.namespace)
+    plc_pid = _restart_runtime(
+        args.config,
+        args.runtime_dir,
+        target,
+        args.namespace,
+        memory_snapshot=memory_snapshot,
+    )
+    _write_event(
+        events,
+        args,
+        "openplc_state_handoff",
+        f"restored {len(memory_snapshot['md'])} MD values and {len(memory_snapshot['coils'])} coils into {target}",
+    )
     restored_binary = rt.output_dir / "plcs" / target.lower()
     restored_hash = _sha256(restored_binary) if restored_binary.is_file() else ""
     _append_log(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare and run the single-observation experiment matrix from TODO2.md."""
+"""Prepare and run the single-observation experiment matrix."""
 from __future__ import annotations
 
 import argparse
@@ -171,7 +171,7 @@ def _attempt_config(archive: Path, spec: dict[str, Any], attempt: int) -> tuple[
     cfg = deepcopy(spec["config"])
     cfg["output_path"] = str(output_dir)
     cfg["experiment"]["attempt"] = attempt
-    cfg["experiment"]["base_config"] = str(PROJECT_ROOT / "TODO2.md")
+    cfg["experiment"]["base_config"] = str(PROJECT_ROOT / "examples/c_town/config.yaml")
     with config_path.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(cfg, handle, allow_unicode=True, sort_keys=False)
     return config_path, output_dir

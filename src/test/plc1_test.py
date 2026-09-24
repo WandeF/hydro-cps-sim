@@ -35,8 +35,11 @@ from __future__ import annotations
 import struct
 import sys
 import time
-import struct
-from pymodbus.client.sync import ModbusTcpClient
+
+try:
+    from pymodbus.client import ModbusTcpClient
+except ImportError:  # pymodbus < 3
+    from pymodbus.client.sync import ModbusTcpClient
 _USE_SLAVE_KEY = False
 
 

@@ -28,6 +28,12 @@ class Todo3ExperimentTests(unittest.TestCase):
         link = next(item for item in congestion["network"]["backbone_links"] if item["name"] == "r0-r4")
         self.assertEqual(link["data_rate"], "10Mbps")
         self.assertEqual(link["queue"]["max_packets"], 20)
+        self.assertTrue(all(
+            item["data_rate"] == "100Mbps"
+            for item in congestion["network"]["backbone_links"]
+            if item["name"] != "r0-r4"
+        ))
+        self.assertTrue(all(item["data_rate"] == "100Mbps" for item in congestion["network"]["lans"]))
         self.assertTrue(all(scenario["target"]["endpoint"] == "PLC4" for scenario in congestion["attacks"]["scenarios"]))
         self.assertAlmostEqual(
             sum(float(scenario["traffic"]["rate"].removesuffix("Mbps")) for scenario in congestion["attacks"]["scenarios"]),

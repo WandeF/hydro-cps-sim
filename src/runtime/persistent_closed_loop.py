@@ -479,6 +479,8 @@ def persist_physics_snapshot(
     write_json(physics_path, snapshot)
     append_jsonl(raw_dir(runtime_dir) / "physics.jsonl", snapshot)
     _write_physics_csv(runtime_dir, rt, snapshot)
+    if str(snapshot.get("backend", "")).startswith("data_feed"):
+        _write_physics_csv(runtime_dir, rt, snapshot, filename="data_feed.csv")
     if event_logger is not None:
         values = snapshot.get("values", {}) or {}
         events = [make_event(
@@ -872,7 +874,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", required=True, type=Path)
     p.add_argument("--iterations", type=int, default=None)
     p.add_argument("--python", dest="python_bin", default=sys.executable, help="Python executable visible inside namespaces")
-    p.add_argument("--physics-mode", choices=["dhalsim_epynet", "epynet"], default="dhalsim_epynet")
+    p.add_argument("--physics-mode", choices=["dhalsim_epynet", "epynet", "data_feed"], default="dhalsim_epynet")
     p.add_argument("--modbus-port", type=int, default=502)
     p.add_argument("--unit-id", type=int, default=1)
     p.add_argument("--timeout", type=float, default=2.0)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare and execute the single-observation supplement defined by TODO3.md."""
+"""Prepare and execute the single-observation experiment supplement."""
 from __future__ import annotations
 
 import argparse
@@ -160,11 +160,23 @@ def configure_target_links(
 
 
 def configure_three_bot_plc4(cfg: dict[str, Any], rho: float) -> None:
-    # Keep the source LAN/uplink above the intended r0->r4 bottleneck.
-    set_link(cfg, "r0-r_scada", data_rate="100Mbps", delay="2ms", queue={"type": "DropTailQueue", "max_packets": 100}, error_model=None)
+    # The three-bot template was originally authored for PLC2 and therefore
+    # carries legacy 10 Mbps settings on r0-r2, plc2_lan, and scada_lan.  Reset
+    # every non-target segment before introducing the *single* PLC4 bottleneck;
+    # otherwise the experiment changes both the PLC2 and PLC4 paths at once.
+    for link in cfg["network"]["backbone_links"]:
+        link.update({
+            "data_rate": "100Mbps",
+            "delay": "2ms",
+            "queue": {"type": "DropTailQueue", "max_packets": 100},
+            "error_model": None,
+        })
+    for lan in cfg["network"]["lans"]:
+        lan["data_rate"] = "100Mbps"
+
+    # Traffic from the SCADA-side bots to PLC4 follows
+    # scada_lan -> r0-r_scada -> r0-r4 -> plc4_lan.  Only r0-r4 is constrained.
     set_link(cfg, "r0-r4", data_rate="10Mbps", delay="2ms", queue={"type": "DropTailQueue", "max_packets": 20}, error_model=None)
-    set_lan_rate(cfg, "scada_lan", "100Mbps")
-    set_lan_rate(cfg, "plc4_lan", "100Mbps")
     attacks = cfg.setdefault("attacks", {})
     attacks["enabled"] = rho > 0
     scenarios = attacks.get("scenarios", []) or []
@@ -317,7 +329,7 @@ def attempt_paths(archive: Path, spec: dict[str, Any], attempt: int) -> tuple[Pa
     cfg = deepcopy(spec["config"])
     cfg["output_path"] = str(output_dir)
     cfg["experiment"]["attempt"] = attempt
-    cfg["experiment"]["requirements_file"] = str(PROJECT_ROOT / "TODO3.md")
+    cfg["experiment"]["requirements_file"] = str(Path(__file__).resolve())
     config_path = attempt_dir / "config.yaml"
     config_path.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
     (attempt_dir / "workspace.patch").write_text(workspace_patch(), encoding="utf-8")
@@ -340,7 +352,7 @@ def prepare(archive: Path) -> list[dict[str, Any]]:
     plan = {
         "schema_version": 1,
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "requirements": str(PROJECT_ROOT / "TODO3.md"),
+        "requirements": str(Path(__file__).resolve()),
         "formal_run_count": len(specs),
         "sample_size_precheck": {
             "source": "reused 0%/2ms/100Mbps run",

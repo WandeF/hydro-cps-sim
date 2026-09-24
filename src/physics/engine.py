@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from src.core.config import RuntimeConfig
+from src.physics.data_feed import DataFeed, from_runtime_config
 
 
 # EPANET Toolkit numeric constants.  They are stable across EPANET 2.0/2.2 and
@@ -46,7 +47,7 @@ EN_SETTING = 12
 
 
 class PhysicsEngine:
-    VALID_MODES = {"dhalsim_epynet", "epynet"}
+    VALID_MODES = {"dhalsim_epynet", "epynet", "data_feed"}
 
     def __init__(self, cfg: RuntimeConfig, mode: str = "auto", work_dir: Path | None = None) -> None:
         self.cfg = cfg
@@ -88,9 +89,17 @@ class PhysicsEngine:
         self.link_index: dict[str, int] = {}
         self.last_internal_steps = 0
         self.last_epanet_time = 0
+        self.data_feed: DataFeed | None = None
 
         if mode not in self.VALID_MODES:
-            raise ValueError("mode must be one of: dhalsim_epynet, epynet")
+            raise ValueError("mode must be one of: dhalsim_epynet, epynet, data_feed")
+
+        if mode == "data_feed":
+            self.data_feed = from_runtime_config(cfg.raw)
+            self.backend_kind = "data_feed"
+            self.available = True
+            self.state = self.data_feed.values(0)
+            return
 
         self._try_init_dhalsim_epynet()
         if not self.available:
@@ -825,7 +834,15 @@ class PhysicsEngine:
         }
 
     def current_snapshot(self, iteration: int | None = None) -> dict[str, Any]:
-        if self.available and self.backend_kind == "dhalsim_epynet":
+        if self.available and self.backend_kind == "data_feed":
+            snapshot_iteration = self.iteration if iteration is None else iteration
+            if self.data_feed is None:
+                raise RuntimeError("data-feed backend is not initialized")
+            self.state = self.data_feed.values(snapshot_iteration)
+            self.sim_time = snapshot_iteration
+            link_status, link_flow = {}, {}
+            backend = "data_feed"
+        elif self.available and self.backend_kind == "dhalsim_epynet":
             self.state = self._capture_epynet_state()
             link_status, link_flow = self._capture_epynet_link_diagnostics()
             backend = "dhalsim_epynet_initial" if self.sim_time == 0 else "dhalsim_epynet_snapshot"
@@ -867,16 +884,22 @@ class PhysicsEngine:
         link_status: dict[str, float] = {}
         link_flow: dict[str, float] = {}
 
-        if not (self.available and self.backend_kind == "dhalsim_epynet"):
+        if self.available and self.backend_kind == "data_feed":
+            if self.data_feed is None:
+                raise RuntimeError("data-feed backend is not initialized")
+            self.state = self.data_feed.values(self.iteration)
+            self.sim_time = self.iteration
+            backend = "data_feed"
+        elif not (self.available and self.backend_kind == "dhalsim_epynet"):
             raise RuntimeError("DHALSIM-epynet is not available; no alternate physics backend is enabled")
-
-        try:
-            self.state = self._run_epynet_step(self.actuator_state)
-            link_status, link_flow = self._capture_epynet_link_diagnostics()
-            backend = "dhalsim_epynet"
-        except Exception as exc:
-            self.warning = f"DHALSIM-epynet step failed at iteration {self.iteration}: {exc}"
-            raise RuntimeError(self.warning) from exc
+        else:
+            try:
+                self.state = self._run_epynet_step(self.actuator_state)
+                link_status, link_flow = self._capture_epynet_link_diagnostics()
+                backend = "dhalsim_epynet"
+            except Exception as exc:
+                self.warning = f"DHALSIM-epynet step failed at iteration {self.iteration}: {exc}"
+                raise RuntimeError(self.warning) from exc
 
         result_iteration = self.iteration
         result = {

@@ -11,7 +11,7 @@ SKIP_PREP=0
 SKIP_COMPILE=0
 SKIP_NS3=0
 NS3_START_WAIT="${NS3_START_WAIT:-2}"
-NS3_READY_TIMEOUT="${NS3_READY_TIMEOUT:-180}"
+NS3_READY_TIMEOUT="${NS3_READY_TIMEOUT:-1200}"
 NS3_DRAIN_SEC="${NS3_DRAIN_SEC:-}"
 POLL_INTERVAL="${POLL_INTERVAL:-0.005}"
 SYNC_TIMEOUT="${SYNC_TIMEOUT:-30.0}"
@@ -28,6 +28,8 @@ HELICS_BROKER_PID=""
 SCADA_MODBUS_WORKERS="${SCADA_MODBUS_WORKERS:-8}"
 MODBUS_TIMEOUT="${MODBUS_TIMEOUT:-2.0}"
 CONNECT_RETRIES="${CONNECT_RETRIES:-60}"
+PHYSICS_MODE="${PHYSICS_MODE:-dhalsim_epynet}"
+INIT_STYLE="${INIT_STYLE:-dhalsim}"
 NO_BATCH_MODBUS=0
 NO_PERSISTENT_SCADA_CONNECTIONS=0
 CLEAN_RUNTIME="${CLEAN_RUNTIME:-1}"
@@ -79,7 +81,7 @@ Options:
 Environment:
   PYTHON_BIN          Python executable visible from namespaces
   NS3_START_WAIT      Seconds to wait after starting ns-3. Default: 2
-  NS3_READY_TIMEOUT   Maximum seconds to wait for ns-3 build/start readiness. Default: 180
+  NS3_READY_TIMEOUT   Maximum seconds to wait for ns-3 build/start readiness. Default: 1200
   NS3_DRAIN_SEC       Network drain period; defaults to experiment.drain_period_sec
   POLL_INTERVAL       Filesystem marker polling interval. Default: 0.005
   SYNC_TIMEOUT        Marker wait timeout. Default: 30.0
@@ -93,6 +95,8 @@ Environment:
   SCADA_MODBUS_WORKERS Concurrent PLC Modbus workers for SCADA. Default: 8
   MODBUS_TIMEOUT      Per-request Modbus timeout in seconds. Default: 2.0
   CONNECT_RETRIES     Initial Modbus connection retry limit. Default: 60
+  PHYSICS_MODE        dhalsim_epynet, epynet, or data_feed. Default: dhalsim_epynet
+  INIT_STYLE          dhalsim or current. Scale data-feed runs use current
   RUN_COMPARE         1 to compare run outputs against baseline. Default: 0
   CLEAN_RUNTIME       1 to delete output/runtime and output/check before run. Default: 1
   STOP_PLC_ON_EXIT    1 to stop PLC runtimes when run_all exits. Default: 1
@@ -436,7 +440,7 @@ ensure_sudo() {
     echo "[SUDO] cached credentials available"
   else
     echo "[SUDO] root permission is required for namespace, TAP, OpenPLC/ns-3, and closed-loop execution."
-    sudo -v
+    sudo -v || return $?
   fi
 
   # Keep the sudo timestamp alive because preparation/compilation can take longer
@@ -752,6 +756,7 @@ echo "[NS3]         $NS3_PATH"
 echo "[ITERATIONS]  $ITERATIONS"
 echo "[PYTHON]      $PYTHON_BIN"
 echo "[SYNC]        $SYNC_BACKEND"
+echo "[PHYSICS]     $PHYSICS_MODE (init=$INIT_STYLE)"
 if [[ "$SYNC_BACKEND" == "helics" ]]; then
   echo "[HELICS]      core_type=$HELICS_CORE_TYPE core_init=$HELICS_CORE_INIT broker=$HELICS_BROKER_ADDRESS"
 fi
@@ -816,8 +821,8 @@ time_stage "Run persistent closed-loop control" sudo "$PYTHON_BIN" -m src.runtim
   --config "$CONFIG" \
   --iterations "$ITERATIONS" \
   --python "$PYTHON_BIN" \
-  --physics-mode dhalsim_epynet \
-  --init-style dhalsim \
+  --physics-mode "$PHYSICS_MODE" \
+  --init-style "$INIT_STYLE" \
   --poll-interval "$POLL_INTERVAL" \
   --sync-timeout "$SYNC_TIMEOUT" \
   --timeout "$MODBUS_TIMEOUT" \

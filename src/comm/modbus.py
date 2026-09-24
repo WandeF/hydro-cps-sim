@@ -60,6 +60,14 @@ def _call_with_unit(fn, *args, unit_id: int = DEFAULT_UNIT_ID, **kwargs):
     raise RuntimeError("unreachable pymodbus call path")
 
 
+def _read_with_count(fn, address: int, count: int, **kwargs):
+    """Call pymodbus read APIs across positional/keyword-only count versions."""
+    try:
+        return fn(address, count, **kwargs)
+    except TypeError:
+        return fn(address, count=count, **kwargs)
+
+
 def _contiguous_ranges(indices: Iterable[int]) -> list[tuple[int, int]]:
     ordered = sorted({int(i) for i in indices})
     if not ordered:
@@ -255,7 +263,9 @@ class ModbusEndpoint:
             "read_holding_registers",
             addr,
             2,
-            self.client.read_holding_registers,
+            lambda address, count, **kwargs: _read_with_count(
+                self.client.read_holding_registers, address, count, **kwargs
+            ),
             addr,
             2,
             description=f"read %MD{md_index} addr={addr}",
@@ -277,7 +287,9 @@ class ModbusEndpoint:
                 "read_holding_registers",
                 addr,
                 count,
-                self.client.read_holding_registers,
+                lambda address, count, **kwargs: _read_with_count(
+                    self.client.read_holding_registers, address, count, **kwargs
+                ),
                 addr,
                 count,
                 description=f"batch read %MD{start}..%MD{end} addr={addr} count={count}",
@@ -318,7 +330,9 @@ class ModbusEndpoint:
             "read_coils",
             int(coil_index),
             1,
-            self.client.read_coils,
+            lambda address, count, **kwargs: _read_with_count(
+                self.client.read_coils, address, count, **kwargs
+            ),
             int(coil_index),
             1,
             description=f"read coil {coil_index}",
@@ -335,7 +349,9 @@ class ModbusEndpoint:
                 "read_coils",
                 int(start),
                 count,
-                self.client.read_coils,
+                lambda address, count, **kwargs: _read_with_count(
+                    self.client.read_coils, address, count, **kwargs
+                ),
                 int(start),
                 count,
                 description=f"batch read coils {start}..{end}",
