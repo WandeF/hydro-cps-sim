@@ -20,6 +20,7 @@ the discrete closed-loop order x_k -> controller -> u_k -> plant -> x_{k+1}.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import subprocess
 import sys
@@ -32,7 +33,6 @@ from src.io.dhalsim import write_physics_row
 from src.physics.engine import PhysicsEngine
 from src.core.config import load_runtime_config, read_json, write_json
 from src.sync.filesystem import DEFAULT_POLL_INTERVAL, clear_ready_files, marker_path, touch_marker
-from src.sync.helics_sync import HelicsSync, coordinator_endpoint, plc_endpoint, scada_endpoint
 
 
 def ensure_root() -> None:
@@ -120,13 +120,6 @@ def launch_daemons(
         "--max-iterations", str(max_iterations),
         "--poll-interval", str(args.poll_interval),
         "--sync-timeout", str(args.sync_timeout),
-        "--sync-backend", str(args.sync_backend),
-        "--helics-core-type", str(args.helics_core_type),
-        "--helics-core-init", str(args.helics_core_init),
-        "--helics-broker-address", str(args.helics_broker_address),
-        "--helics-time-delta", str(args.helics_time_delta),
-        "--helics-prefix", str(args.helics_prefix),
-        "--helics-log-level", str(args.helics_log_level),
     ]
 
     for plc in rt.plcs.values():
@@ -175,19 +168,6 @@ def launch_daemons(
     _check_processes(processes)
     return processes, log_handles
 
-
-
-
-def _send_helics_stop(sync: HelicsSync | None, rt) -> None:  # type: ignore[no-untyped-def]
-    if sync is None:
-        return
-    try:
-        sync.send(scada_endpoint(sync.prefix), "stop", payload={"reason": "coordinator shutdown"})
-        for plc in rt.plcs.values():
-            sync.send(plc_endpoint(plc.lower_name, sync.prefix), "stop", payload={"reason": "coordinator shutdown"})
-        sync.flush_time()
-    except Exception as exc:
-        print(f"[HELICS][WARN] failed to send stop messages: {exc}")
 
 def stop_daemons(processes: dict[str, subprocess.Popen], log_handles: list[Any], sync_dir: Path, *, grace: float = 3.0) -> None:
     try:
@@ -331,10 +311,6 @@ def release_physics_snapshot(
     iteration: int,
     physics_path: Path,
     snapshot: dict[str, Any],
-    *,
-    sync_backend: str = "filesystem",
-    helics_sync: HelicsSync | None = None,
-    rt=None,
 ) -> None:
     """Release waiting PLC/SCADA daemons after a physics state is fully prepared."""
     payload = {
@@ -343,30 +319,7 @@ def release_physics_snapshot(
         "backend": snapshot.get("backend"),
         "advanced": bool(snapshot.get("advanced", False)),
     }
-    if sync_backend == "helics":
-        if helics_sync is None or rt is None:
-            raise RuntimeError("HELICS sync backend requires helics_sync and runtime config")
-        for plc in rt.plcs.values():
-            helics_sync.send(plc_endpoint(plc.lower_name, helics_sync.prefix), "physics", iteration, payload)
-        helics_sync.flush_time()
-    else:
-        touch_marker(marker_path(sync_dir, "physics", iteration), payload)
-
-
-def publish_physics_snapshot(
-    runtime_dir: Path,
-    sync_dir: Path,
-    rt,
-    iteration: int,
-    snapshot: dict[str, Any],
-    *,
-    sync_backend: str = "filesystem",
-    helics_sync: HelicsSync | None = None,
-) -> Path:  # type: ignore[no-untyped-def]
-    """Persist one physics state and release waiting PLC/SCADA daemons."""
-    physics_path = persist_physics_snapshot(runtime_dir, rt, iteration, snapshot)
-    release_physics_snapshot(sync_dir, iteration, physics_path, snapshot, sync_backend=sync_backend, helics_sync=helics_sync, rt=rt)
-    return physics_path
+    touch_marker(marker_path(sync_dir, "physics", iteration), payload)
 
 
 def _run_bootstrap_cmd(cmd: list[str], *, project_root: Path, log) -> None:  # type: ignore[no-untyped-def]
@@ -535,7 +488,6 @@ def bootstrap_preload_initial_state(
     )
 
 
-
 def prepare_runtime_csv_dir(runtime_dir: Path) -> None:
     """Start each run with fresh operator-facing CSV outputs."""
     path = csv_dir(runtime_dir)
@@ -550,7 +502,6 @@ def prepare_runtime_raw_dir(runtime_dir: Path) -> None:
     if path.exists():
         for old in path.glob("*.jsonl"):
             old.unlink()
-
 
 
 def _enabled_attack_scenarios(raw_cfg: dict[str, Any]) -> list[dict[str, Any]]:
@@ -621,6 +572,13 @@ def _stop_configured_attacks(args: argparse.Namespace, project_root: Path, runti
     except Exception as exc:
         print(f"[ATTACK-SCHED][WARN] failed to stop configured attacks: {exc}")
 
+def nonnegative_seconds(value: str) -> float:
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError("must be finite and nonnegative")
+    return seconds
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Run persistent Hydro-CPS-Sim closed-loop control")
     p.add_argument("--config", required=True, type=Path)
@@ -630,17 +588,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--modbus-port", type=int, default=502)
     p.add_argument("--unit-id", type=int, default=1)
     p.add_argument("--timeout", type=float, default=2.0)
-    p.add_argument("--logic-wait", type=float, default=0.30, help="Seconds to wait after SCADA downlink before actuator read")
+    p.add_argument("--logic-wait", type=nonnegative_seconds, default=0.30, help="Seconds to wait after SCADA downlink before actuator read")
     p.add_argument("--cycle-wait", type=float, default=0.0)
     p.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL, help="Filesystem marker polling interval in seconds. Default: env HYDRO_CPS_POLL_INTERVAL or 0.005")
     p.add_argument("--sync-timeout", type=float, default=30.0)
-    p.add_argument("--sync-backend", choices=["filesystem", "helics"], default="filesystem", help="Synchronization backend for runtime cycle signals")
-    p.add_argument("--helics-core-type", default="ipc", help="HELICS core type, e.g. ipc, zmq, tcp")
-    p.add_argument("--helics-core-init", default="", help="HELICS core init string passed to each federate")
-    p.add_argument("--helics-broker-address", default="", help="Optional HELICS broker address, e.g. tcp://127.0.0.1:23405")
-    p.add_argument("--helics-time-delta", type=float, default=0.001, help="HELICS time delta used while waiting for messages")
-    p.add_argument("--helics-prefix", default="hydro", help="HELICS endpoint prefix")
-    p.add_argument("--helics-log-level", type=int, default=1)
     p.add_argument("--daemon-start-wait", type=float, default=0.8)
     p.add_argument(
         "--init-style",
@@ -707,7 +658,6 @@ def main() -> int:
     log_handles: list[Any] = []
     cycle_summaries: list[dict[str, Any]] = []
     timing_rows: list[dict[str, Any]] = []
-    coord_sync: HelicsSync | None = None
 
     try:
         if args.init_style == "dhalsim":
@@ -751,14 +701,6 @@ def main() -> int:
             max_iterations=control_iterations,
         )
 
-        if args.sync_backend == "helics":
-            coord_sync = HelicsSync.from_args(
-                "hydro_coordinator",
-                coordinator_endpoint(args.helics_prefix),
-                args,
-                timeout=args.sync_timeout,
-            ).start()
-            print(f"[HELICS] coordinator federate ready endpoint={coord_sync.endpoint}")
 
         # Persist the initial state used by PLC/SCADA, but do not release the
         # marker until PLC memories have been preloaded. This prevents cold-start
@@ -781,9 +723,6 @@ def main() -> int:
             initial_iteration,
             input_physics_path,
             initial_snapshot,
-            sync_backend=args.sync_backend,
-            helics_sync=coord_sync,
-            rt=rt,
         )
         print(f"[INIT] physics_{initial_iteration:04d}.ready released")
 
@@ -804,25 +743,15 @@ def main() -> int:
 
             # 1) PLC adapters consume physics_i and write local sensor registers.
             local_wait_t0 = time.monotonic()
-            if args.sync_backend == "helics":
-                if coord_sync is None:
-                    raise RuntimeError("HELICS coordinator sync is not initialized")
-                coord_sync.wait_for("local_write", iteration=i, count=len(rt.plcs), timeout=args.sync_timeout)
-            else:
-                local_markers = [marker_path(sync_dir, "local_write", i, plc.lower_name) for plc in rt.plcs.values()]
-                wait_for_markers_checked(local_markers, processes, timeout=args.sync_timeout, poll_interval=args.poll_interval, stop_dir=sync_dir)
+            local_markers = [marker_path(sync_dir, "local_write", i, plc.lower_name) for plc in rt.plcs.values()]
+            wait_for_markers_checked(local_markers, processes, timeout=args.sync_timeout, poll_interval=args.poll_interval, stop_dir=sync_dir)
             timing["wait_local_write_sec"] = time.monotonic() - local_wait_t0
             print(f"[CYCLE {i}] all PLC local sensor writes completed from physics_{i:04d}")
 
             # 2) SCADA polls/downlinks dependency data derived from physics_i.
             scada_wait_t0 = time.monotonic()
-            if args.sync_backend == "helics":
-                if coord_sync is None:
-                    raise RuntimeError("HELICS coordinator sync is not initialized")
-                coord_sync.wait_for("scada_downlink", iteration=i, count=1, timeout=args.sync_timeout)
-            else:
-                scada_marker = marker_path(sync_dir, "scada_downlink", i)
-                wait_for_marker_checked(scada_marker, processes, timeout=args.sync_timeout, poll_interval=args.poll_interval, stop_dir=sync_dir)
+            scada_marker = marker_path(sync_dir, "scada_downlink", i)
+            wait_for_marker_checked(scada_marker, processes, timeout=args.sync_timeout, poll_interval=args.poll_interval, stop_dir=sync_dir)
             timing["wait_scada_downlink_sec"] = time.monotonic() - scada_wait_t0
             print(f"[CYCLE {i}] SCADA poll/downlink completed")
 
@@ -835,24 +764,12 @@ def main() -> int:
 
             # 4) Read u_i from PLC coils.
             signal_t0 = time.monotonic()
-            if args.sync_backend == "helics":
-                if coord_sync is None:
-                    raise RuntimeError("HELICS coordinator sync is not initialized")
-                for plc in rt.plcs.values():
-                    coord_sync.send(plc_endpoint(plc.lower_name, coord_sync.prefix), "read_actuators", i, {"iteration": i})
-                coord_sync.flush_time()
-            else:
-                touch_marker(marker_path(sync_dir, "read_actuators", i), {"iteration": i})
+            touch_marker(marker_path(sync_dir, "read_actuators", i), {"iteration": i})
             timing["signal_read_actuators_sec"] = time.monotonic() - signal_t0
 
             actuator_wait_t0 = time.monotonic()
-            if args.sync_backend == "helics":
-                if coord_sync is None:
-                    raise RuntimeError("HELICS coordinator sync is not initialized")
-                coord_sync.wait_for("actuators", iteration=i, count=len(rt.plcs), timeout=args.sync_timeout)
-            else:
-                actuator_markers = [marker_path(sync_dir, "actuators", i, plc.lower_name) for plc in rt.plcs.values()]
-                wait_for_markers_checked(actuator_markers, processes, timeout=args.sync_timeout, poll_interval=args.poll_interval, stop_dir=sync_dir)
+            actuator_markers = [marker_path(sync_dir, "actuators", i, plc.lower_name) for plc in rt.plcs.values()]
+            wait_for_markers_checked(actuator_markers, processes, timeout=args.sync_timeout, poll_interval=args.poll_interval, stop_dir=sync_dir)
             timing["wait_actuator_read_sec"] = time.monotonic() - actuator_wait_t0
 
             merge_t0 = time.monotonic()
@@ -875,9 +792,6 @@ def main() -> int:
                 i + 1,
                 output_physics_path,
                 next_physics_snapshot,
-                sync_backend=args.sync_backend,
-                helics_sync=coord_sync,
-                rt=rt,
             )
             timing["physics_step_publish_sec"] = time.monotonic() - physics_t0
             timing["physics_value_count"] = len(next_physics_snapshot.get("values", {}) or {})
@@ -941,12 +855,6 @@ def main() -> int:
 
 
     finally:
-        _send_helics_stop(coord_sync, rt)
-        try:
-            if coord_sync is not None:
-                coord_sync.close()
-        except Exception:
-            pass
         try:
             physics.close()
         except Exception:
@@ -961,7 +869,6 @@ def main() -> int:
     print(f"[TIMING-CSV]  {csv_dir(runtime_dir) / 'closed_loop_timing.csv'}")
     print(f"[TIMING-SUM]  {csv_dir(runtime_dir) / 'closed_loop_timing_summary.csv'}")
     print(f"[JSON]        {json_dir(runtime_dir)}")
-    print(f"[CHECK]       run scripts/check.sh after runtime if actuator/open-loop verification is needed")
     print(f"[SUMMARY]     {json_dir(runtime_dir) / 'closed_loop_summary.json'}")
     print(f"[LOGS]        {runtime_dir / 'logs'}")
     return 0

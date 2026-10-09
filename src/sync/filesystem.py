@@ -4,7 +4,7 @@
 
 Network namespaces do not isolate the filesystem in the current Hydro-CPS-Sim
 setup, so processes started via `ip netns exec` can use a shared runtime/sync
-folder as a first-stage synchronization mechanism.
+folder to synchronize the stages of each control cycle.
 """
 from __future__ import annotations
 

@@ -1,8 +1,20 @@
+# C-Town geographic PLC mapping (PLC1-PLC8).
+# Previous proposal IDs PLC7/PLC8/PLC9 are now PLC6/PLC7/PLC8.
+# Each tank has one sensor owner; SCADA forwards remote control dependencies.
+# Preserve the INP's 20 level-control rules and initial hydraulic states.
+# PU3 and PU9 are assigned standby outputs: initially closed, no automatic rules.
+# PRVs V45/V47/v1 are monitored via flow and endpoint pressure sensors only;
+# their hydraulic status/settings remain in ctown_map.inp (no PLC output coils).
+# Sensor suffix F means link flow; J* means junction pressure; T* means tank level.
+# Regional ownership can include remote I/O; it does not imply a shared cabinet.
+
 actuators:
 - initial_state: closed
   name: PU1
 - initial_state: open
   name: PU2
+- initial_state: closed
+  name: PU3
 - initial_state: closed
   name: PU4
 - initial_state: closed
@@ -42,15 +54,22 @@ physics:
   step_order: next-run
   init_flag: 0
 plcs:
+# Southeast source R1 / S1: PU1-PU3; remote T1 from PLC2.
 - name: PLC1
   sensors:
   - PU1F
+  - J285
+  - J273
   - PU2F
   - J280
   - J269
+  - PU3F
+  - J276
+  - J274
   actuators:
   - PU1
   - PU2
+  - PU3
   controls:
   - action: open
     actuator: PU1
@@ -72,15 +91,30 @@ plcs:
     dependant: T1
     type: above
     value: 4.5
+# Western tank station: local T1; telemetry to PLC1.
 - name: PLC2
   sensors:
   - T1
+  actuators: []
+  controls: []
+# South-central S2: PU4/PU5 and V2; local T2/T3 controls.
+- name: PLC3
+  sensors:
+  - T2
+  - T3
+  - PU4F
+  - J299
+  - J292
+  - PU5F
+  - J300
+  - J256
+  - V2F
+  - J14
+  - J422
   actuators:
-  - V2
   - PU4
   - PU5
-  - PU6
-  - PU7
+  - V2
   controls:
   - action: open
     actuator: V2
@@ -112,48 +146,25 @@ plcs:
     dependant: T3
     type: above
     value: 3.5
-  - action: open
-    actuator: PU6
-    dependant: T4
-    type: below
-    value: 2.0
-  - action: closed
-    actuator: PU6
-    dependant: T4
-    type: above
-    value: 3.5
-  - action: open
-    actuator: PU7
-    dependant: T4
-    type: below
-    value: 3.0
-  - action: closed
-    actuator: PU7
-    dependant: T4
-    type: above
-    value: 4.5
-- name: PLC3
-  sensors:
-  - T2
-  - V2F
-  - J300
-  - J256
-  - J289
-  - J415
-  - J14
-  - J422
-  - PU4F
-  - PU5F
-  - PU6F
-  - PU7F
-  actuators: []
-  controls: []
+# Central S4/S5: PU8-PU11 and local T6; remote T5 (PLC6), T7 (PLC8). T6 is monitoring only.
 - name: PLC4
   sensors:
-  - T3
-  - T4
+  - T6
+  - PU8F
+  - J301
+  - J304
+  - PU9F
+  - J302
+  - J306
+  - PU10F
+  - J307
+  - J317
+  - PU11F
+  - J309
+  - J323
   actuators:
   - PU8
+  - PU9
   - PU10
   - PU11
   controls:
@@ -187,28 +198,62 @@ plcs:
     dependant: T7
     type: above
     value: 3.0
+# East-central S3: PU6/PU7; remote T4 from PLC7.
 - name: PLC5
   sensors:
-  - PU8F
-  - PU10F
-  - PU11F
-  - J302
-  - J306
-  - J307
-  - J317
-  actuators: []
-  controls: []
-- name: PLC7
+  - PU6F
+  - J289
+  - J415
+  - PU7F
+  - J290
+  - J291
+  actuators:
+  - PU6
+  - PU7
+  controls:
+  - action: open
+    actuator: PU6
+    dependant: T4
+    type: below
+    value: 2.0
+  - action: closed
+    actuator: PU6
+    dependant: T4
+    type: above
+    value: 3.5
+  - action: open
+    actuator: PU7
+    dependant: T4
+    type: below
+    value: 3.0
+  - action: closed
+    actuator: PU7
+    dependant: T4
+    type: above
+    value: 4.5
+# Northern T5 station and V45/V47 flow/pressure monitoring; telemetry to PLC4.
+- name: PLC6
   sensors:
   - T5
+  - V45F
+  - J253
+  - J130
+  - V47F
+  - J129
+  - J169
   actuators: []
   controls: []
-- name: PLC8
+# Northeast T4 station and v1 flow/pressure monitoring; telemetry to PLC5.
+- name: PLC7
   sensors:
-  - T6
+  - T4
+  - v1F
+  - J35
+  - J88
   actuators: []
   controls: []
-- name: PLC9
+# T7 tank station; telemetry to PLC4.
+- name: PLC8
   sensors:
   - T7
   actuators: []
@@ -247,11 +292,11 @@ network:
       role: edge_router
     - name: r5
       role: edge_router
+    - name: r6
+      role: edge_router
     - name: r7
       role: edge_router
     - name: r8
-      role: edge_router
-    - name: r9
       role: edge_router
     switches:
     - name: s_scada
@@ -266,11 +311,11 @@ network:
       role: bridge_switch
     - name: s5
       role: bridge_switch
+    - name: s6
+      role: bridge_switch
     - name: s7
       role: bridge_switch
     - name: s8
-      role: bridge_switch
-    - name: s9
       role: bridge_switch
     endpoints:
     - name: PLC1
@@ -293,6 +338,10 @@ network:
       role: plc
       namespace: ns-plc5
       tap: tap-plc5
+    - name: PLC6
+      role: plc
+      namespace: ns-plc6
+      tap: tap-plc6
     - name: PLC7
       role: plc
       namespace: ns-plc7
@@ -301,10 +350,6 @@ network:
       role: plc
       namespace: ns-plc8
       tap: tap-plc8
-    - name: PLC9
-      role: plc
-      namespace: ns-plc9
-      tap: tap-plc9
     - name: scada
       role: scada
       namespace: ns-scada
@@ -410,6 +455,22 @@ network:
       r5:
         ifname: r5-uplink
         ip: 10.0.5.2/24
+  - name: r0-r6
+    type: point_to_point
+    endpoints:
+    - r0
+    - r6
+    data_rate: 100Mbps
+    delay: 2ms
+    mtu: 1500
+    subnet: 10.0.6.0/24
+    interfaces:
+      r0:
+        ifname: r0-eth6
+        ip: 10.0.6.1/24
+      r6:
+        ifname: r6-uplink
+        ip: 10.0.6.2/24
   - name: r0-r7
     type: point_to_point
     endpoints:
@@ -442,22 +503,6 @@ network:
       r8:
         ifname: r8-uplink
         ip: 10.0.8.2/24
-  - name: r0-r9
-    type: point_to_point
-    endpoints:
-    - r0
-    - r9
-    data_rate: 100Mbps
-    delay: 2ms
-    mtu: 1500
-    subnet: 10.0.9.0/24
-    interfaces:
-      r0:
-        ifname: r0-eth9
-        ip: 10.0.9.1/24
-      r9:
-        ifname: r9-uplink
-        ip: 10.0.9.2/24
   lans:
   - name: scada_lan
     type: csma
@@ -572,6 +617,24 @@ network:
         ifname: PLC5-eth0
         ip: 192.168.5.1/24
         gateway: 192.168.5.254
+  - name: plc6_lan
+    type: csma
+    members:
+    - r6
+    - s6
+    - PLC6
+    data_rate: 100Mbps
+    delay: 100us
+    mtu: 1500
+    subnet: 192.168.6.0/24
+    interfaces:
+      r6:
+        ifname: r6-lan0
+        ip: 192.168.6.254/24
+      PLC6:
+        ifname: PLC6-eth0
+        ip: 192.168.6.1/24
+        gateway: 192.168.6.254
   - name: plc7_lan
     type: csma
     members:
@@ -608,24 +671,6 @@ network:
         ifname: PLC8-eth0
         ip: 192.168.8.1/24
         gateway: 192.168.8.254
-  - name: plc9_lan
-    type: csma
-    members:
-    - r9
-    - s9
-    - PLC9
-    data_rate: 100Mbps
-    delay: 100us
-    mtu: 1500
-    subnet: 192.168.9.0/24
-    interfaces:
-      r9:
-        ifname: r9-lan0
-        ip: 192.168.9.254/24
-      PLC9:
-        ifname: PLC9-eth0
-        ip: 192.168.9.1/24
-        gateway: 192.168.9.254
   taps:
   - endpoint: scada
     tap_name: tap-scada
@@ -651,6 +696,10 @@ network:
     tap_name: tap-plc5
     mode: use_bridge
     host_namespace: ns-plc5
+  - endpoint: PLC6
+    tap_name: tap-plc6
+    mode: use_bridge
+    host_namespace: ns-plc6
   - endpoint: PLC7
     tap_name: tap-plc7
     mode: use_bridge
@@ -659,10 +708,6 @@ network:
     tap_name: tap-plc8
     mode: use_bridge
     host_namespace: ns-plc8
-  - endpoint: PLC9
-    tap_name: tap-plc9
-    mode: use_bridge
-    host_namespace: ns-plc9
   - endpoint: mitm
     tap_name: tap-attacker
     mode: use_bridge
@@ -698,6 +743,11 @@ network:
     dst: PLC5
     protocol: tcp
     dst_port: 502
+  - name: scada_to_plc6
+    src: scada
+    dst: PLC6
+    protocol: tcp
+    dst_port: 502
   - name: scada_to_plc7
     src: scada
     dst: PLC7
@@ -706,11 +756,6 @@ network:
   - name: scada_to_plc8
     src: scada
     dst: PLC8
-    protocol: tcp
-    dst_port: 502
-  - name: scada_to_plc9
-    src: scada
-    dst: PLC9
     protocol: tcp
     dst_port: 502
   attack_points:
@@ -723,9 +768,9 @@ network:
     - r0-r3
     - r0-r4
     - r0-r5
+    - r0-r6
     - r0-r7
     - r0-r8
-    - r0-r9
   - name: scada_path
     type: path
     targets:
@@ -769,6 +814,13 @@ network:
     - s5
     - r5
     - r0
+  - name: plc6_path
+    type: path
+    targets:
+    - PLC6
+    - s6
+    - r6
+    - r0
   - name: plc7_path
     type: path
     targets:
@@ -782,13 +834,6 @@ network:
     - PLC8
     - s8
     - r8
-    - r0
-  - name: plc9_path
-    type: path
-    targets:
-    - PLC9
-    - s9
-    - r9
     - r0
 attacks:
   enabled: true

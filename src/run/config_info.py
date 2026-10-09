@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from src.core.config import load_yaml
+from src.network.network_sh_generation import _endpoint_entries, _linux_ifname, _safe_lower
 
 
 def _resolve_path(config_path: Path, value: Any, *, default: str | None = None) -> Path:
@@ -52,6 +53,14 @@ def main() -> int:
     }
     for key, value in values.items():
         print(f"{key}={shlex.quote(value)}")
+    endpoints = _endpoint_entries(cfg)
+    namespaces = [ep["namespace"] for ep in endpoints]
+    links = [name for ep in endpoints for name in (
+        ep["tap"], f"br-{_safe_lower(ep['name'])}",
+        _linux_ifname(ep["name"], prefix="vr", suffix="root"),
+    )]
+    for key, items in (("NETWORK_NAMESPACES", namespaces), ("NETWORK_LINKS", links)):
+        print(f"{key}=(" + " ".join(shlex.quote(item) for item in items) + ")")
     return 0
 
 

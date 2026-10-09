@@ -352,7 +352,9 @@ def emit_routing_and_end(network_cfg):
         lines.append("  Ipv4GlobalRoutingHelper::PopulateRoutingTables ();")
         lines.append("")
 
-    lines.append('  NS_LOG_UNCOND ("ns3 network started.");')
+    # The launcher waits for this flushed readiness signal, including builds
+    # where ns-3 logging is disabled.
+    lines.append('  std::cout << "ns3 network started." << std::endl;')
     lines.append('  NS_LOG_UNCOND ("Topology loaded from generated config.");')
     lines.append("")
     lines.append("  Simulator::Stop (Seconds (3600));")

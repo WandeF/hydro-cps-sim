@@ -21,7 +21,6 @@ from src.io.csv import append_jsonl, append_row, csv_dir, json_dir, raw_dir
 from src.comm.modbus import ModbusEndpoint
 from src.core.config import MdVar, RuntimeConfig, load_runtime_config, read_json, write_json
 from src.sync.filesystem import DEFAULT_POLL_INTERVAL, marker_path, stop_requested, touch_marker, wait_for_markers
-from src.sync.helics_sync import HelicsSync, coordinator_endpoint, scada_endpoint
 
 _STOP = False
 
@@ -742,15 +741,6 @@ def daemon(args: argparse.Namespace) -> int:
 
     print(f"[SCADA-DAEMON] start runtime={runtime_dir} sync={sync_dir} plcs={expected_local_markers}", flush=True)
 
-    sync: HelicsSync | None = None
-    if args.sync_backend == "helics":
-        sync = HelicsSync.from_args(
-            "hydro_scada",
-            scada_endpoint(args.helics_prefix),
-            args,
-            timeout=args.sync_timeout,
-        ).start()
-        print(f"[SCADA-DAEMON] HELICS endpoint={sync.endpoint}", flush=True)
 
     endpoints: dict[str, ModbusEndpoint] | None = None
     if not args.no_persistent_scada_connections:
@@ -770,17 +760,12 @@ def daemon(args: argparse.Namespace) -> int:
                 args._timeout_grace_active = iteration < grace_end_iteration
 
                 wait_t0 = time.monotonic()
-                if args.sync_backend == "helics":
-                    if sync is None:
-                        raise RuntimeError("HELICS SCADA sync is not initialized")
-                    sync.wait_for("local_write", iteration=iteration, count=len(expected_local_markers), timeout=args.sync_timeout)
-                else:
-                    wait_for_markers(
-                        [marker_path(sync_dir, "local_write", iteration, plc) for plc in expected_local_markers],
-                        timeout=args.sync_timeout,
-                        poll_interval=args.poll_interval,
-                        stop_dir=sync_dir,
-                    )
+                wait_for_markers(
+                    [marker_path(sync_dir, "local_write", iteration, plc) for plc in expected_local_markers],
+                    timeout=args.sync_timeout,
+                    poll_interval=args.poll_interval,
+                    stop_dir=sync_dir,
+                )
                 timing["wait_local_write_markers_sec"] = time.monotonic() - wait_t0
 
                 poll_path = out_json_dir / f"scada_poll_{iteration:04d}.json"
@@ -825,13 +810,7 @@ def daemon(args: argparse.Namespace) -> int:
                     "poll": str(poll_path),
                     "downlink": str(downlink_path),
                 }
-                if args.sync_backend == "helics":
-                    if sync is None:
-                        raise RuntimeError("HELICS SCADA sync is not initialized")
-                    sync.send(coordinator_endpoint(sync.prefix), "scada_downlink", iteration, scada_signal)
-                    sync.flush_time()
-                else:
-                    touch_marker(marker_path(sync_dir, "scada_downlink", iteration), scada_signal)
+                touch_marker(marker_path(sync_dir, "scada_downlink", iteration), scada_signal)
                 timing.update(_count_scada_payloads(poll_payload, downlink_payload))
                 timing["write_outputs_and_marker_sec"] = time.monotonic() - marker_t0
                 timing["cycle_total_sec"] = time.monotonic() - cycle_t0
@@ -850,14 +829,7 @@ def daemon(args: argparse.Namespace) -> int:
                 err_path = out_json_dir / f"error_{iteration:04d}_scada.json"
                 write_json(err_path, {"iteration": iteration, "error": str(exc), "traceback": traceback.format_exc()})
                 error_signal = {"iteration": iteration, "error": str(exc), "output": str(err_path)}
-                if args.sync_backend == "helics" and sync is not None:
-                    try:
-                        sync.send(coordinator_endpoint(sync.prefix), "error", iteration, error_signal)
-                        sync.flush_time()
-                    except Exception:
-                        pass
-                else:
-                    touch_marker(marker_path(sync_dir, "error", iteration, "scada"), error_signal)
+                touch_marker(marker_path(sync_dir, "error", iteration, "scada"), error_signal)
                 print(f"[SCADA-DAEMON][ERR] cycle={iteration}: {exc}", flush=True)
                 if args.keep_running_on_error:
                     iteration += 1
@@ -865,8 +837,6 @@ def daemon(args: argparse.Namespace) -> int:
                 return 1
     finally:
         _close_scada_endpoints(endpoints)
-        if sync is not None:
-            sync.close()
 
     print(f"[SCADA-DAEMON] stop last_iteration={iteration}", flush=True)
     return 0
@@ -902,13 +872,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_daemon.add_argument("--max-iterations", type=int)
     p_daemon.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL, help="Filesystem marker polling interval in seconds")
     p_daemon.add_argument("--sync-timeout", type=float, default=30.0)
-    p_daemon.add_argument("--sync-backend", choices=["filesystem", "helics"], default="filesystem")
-    p_daemon.add_argument("--helics-core-type", default="ipc")
-    p_daemon.add_argument("--helics-core-init", default="")
-    p_daemon.add_argument("--helics-broker-address", default="")
-    p_daemon.add_argument("--helics-time-delta", type=float, default=0.001)
-    p_daemon.add_argument("--helics-prefix", default="hydro")
-    p_daemon.add_argument("--helics-log-level", type=int, default=1)
     p_daemon.add_argument("--connect-retries", type=int, default=10)
     p_daemon.add_argument("--connect-retry-delay", type=float, default=0.2)
     p_daemon.add_argument(

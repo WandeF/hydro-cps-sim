@@ -1,0 +1,11 @@
+# Python 3.10; EPANET wrapper is installed from its pinned Git checkout.
+PyYAML==6.0.3
+pymodbus==2.5.3
+pyserial==3.5
+six==1.17.0
+# Required by the upstream epynet package metadata.
+pandas==2.3.3
+numpy==2.2.6
+python-dateutil==2.9.0.post0
+pytz==2026.2
+tzdata==2026.2

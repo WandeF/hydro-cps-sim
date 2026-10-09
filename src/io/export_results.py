@@ -7,26 +7,11 @@ import csv
 import json
 import re
 import shutil
-import sys
 from pathlib import Path
 from typing import Any
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from src.core.config import load_runtime_config
 from src.io.dhalsim import dhalsim_tag_columns, snapshot_to_dhalsim_row
-
-
-PLC_ORDER = ["PLC1", "PLC2", "PLC3", "PLC4", "PLC5", "PLC7", "PLC8", "PLC9"]
-KEY_SCADA_COLUMNS = [
-    "PLC9.PLC9_T7",
-    "PLC4.PLC4_T3",
-    "PLC4.PLC4_T4",
-    "PLC7.PLC7_T5",
-    "PLC8.PLC8_T6",
-]
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -175,10 +160,8 @@ def export_scada_observed(runtime_dir: Path, reports_csv_dir: Path) -> list[Path
 
     def col_key(col: str) -> tuple[int, str]:
         plc, _, var = col.partition(".")
-        try:
-            plc_idx = PLC_ORDER.index(plc)
-        except ValueError:
-            plc_idx = len(PLC_ORDER)
+        match = re.fullmatch(r"PLC(\d+)", plc)
+        plc_idx = int(match.group(1)) if match else 10**9
         return plc_idx, var
 
     wide_cols = ["iteration"] + sorted(wide_cols_set, key=col_key)
@@ -186,7 +169,9 @@ def export_scada_observed(runtime_dir: Path, reports_csv_dir: Path) -> list[Path
     wide_path = reports_csv_dir / "scada_observed_wide.csv"
     _write_csv(wide_path, wide_rows, wide_cols)
 
-    key_cols = ["iteration"] + KEY_SCADA_COLUMNS
+    key_cols = ["iteration"] + [
+        col for col in wide_cols[1:] if re.fullmatch(r"PLC\d+\.PLC\d+_T\d+", col)
+    ]
     key_rows = [{col: row.get(col, "") for col in key_cols} for row in wide_rows]
     key_path = reports_csv_dir / "scada_observed_key.csv"
     _write_csv(key_path, key_rows, key_cols)

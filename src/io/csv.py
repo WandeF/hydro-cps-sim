@@ -40,12 +40,6 @@ def raw_dir(runtime_dir: Path) -> Path:
     return path
 
 
-def check_dir(output_dir: Path) -> Path:
-    path = output_dir / "check"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
 def _json_default(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
