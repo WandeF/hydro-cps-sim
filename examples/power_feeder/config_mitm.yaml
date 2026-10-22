@@ -1,0 +1,294 @@
+# LOAD_SW=true connects the load; PLC control actions on/off set BOOL outputs.
+output_path: output/mitm
+openplc_path: ../../../OpenPLC_v3
+ns3_path: ../../../ns-3-dev-git
+iterations: 10
+noise_scale: 0.0
+physics:
+  backend: pandapower
+  timestep: 1.0
+  init_style: current
+  model_file: model.yaml
+  solver:
+    algorithm: nr
+    max_iteration: 20
+  sensors:
+    V_CONTROL:
+      table: res_bus
+      element: control
+      column: vm_pu
+    V_LOAD:
+      table: res_bus
+      element: flexible
+      column: vm_pu
+      missing: zero_if_unsupplied
+    P_LOAD:
+      table: res_load
+      element: flexible_load
+      column: p_mw
+    P_GRID:
+      table: res_ext_grid
+      element: utility
+      column: p_mw
+    LINE_LOADING:
+      table: res_line
+      element: feeder_line
+      column: loading_percent
+  actuators:
+    LOAD_SW:
+      table: switch
+      element: load_breaker
+      column: closed
+actuators:
+- name: LOAD_SW
+  initial_state: true
+plcs:
+- name: PLC1
+  sensors:
+  - V_CONTROL
+  - V_LOAD
+  - P_LOAD
+  - P_GRID
+  - LINE_LOADING
+  actuators: []
+  controls: []
+- name: PLC2
+  sensors: []
+  actuators:
+  - LOAD_SW
+  controls:
+  - dependant: V_CONTROL
+    actuator: LOAD_SW
+    type: below
+    value: 0.95
+    action: off
+  - dependant: V_CONTROL
+    actuator: LOAD_SW
+    type: above
+    value: 1.03
+    action: on
+scada:
+  name: scada
+network_topology_type: complex
+network:
+  backend: ns3
+  topology_name: power_feeder
+  scheduler: realtime
+  routing: global
+  pcap: false
+  ascii_trace: false
+  nodes:
+    routers:
+    - name: r0
+      role: core_router
+    - name: r_scada
+      role: edge_router
+    - name: r1
+      role: edge_router
+    - name: r2
+      role: edge_router
+    switches:
+    - name: s_scada
+      role: bridge_switch
+    - name: s1
+      role: bridge_switch
+    - name: s2
+      role: bridge_switch
+    endpoints:
+    - name: PLC1
+      role: plc
+      namespace: ns-power-plc1
+      tap: tap-pwr-plc1
+    - name: PLC2
+      role: plc
+      namespace: ns-power-plc2
+      tap: tap-pwr-plc2
+    - name: scada
+      role: scada
+      namespace: ns-power-scada
+      tap: tap-pwr-scada
+    - name: mitm
+      role: attacker
+      namespace: ns-power-mitm
+      tap: tap-pwr-mitm
+  backbone_links:
+  - name: r0-r_scada
+    type: point_to_point
+    endpoints:
+    - r0
+    - r_scada
+    data_rate: 100Mbps
+    delay: 2ms
+    mtu: 1500
+    subnet: 10.42.255.0/24
+    interfaces:
+      r0:
+        ifname: r0-eth-scada
+        ip: 10.42.255.1/24
+      r_scada:
+        ifname: r_scada-uplink
+        ip: 10.42.255.2/24
+  - name: r0-r1
+    type: point_to_point
+    endpoints:
+    - r0
+    - r1
+    data_rate: 100Mbps
+    delay: 2ms
+    mtu: 1500
+    subnet: 10.42.1.0/24
+    interfaces:
+      r0:
+        ifname: r0-eth1
+        ip: 10.42.1.1/24
+      r1:
+        ifname: r1-uplink
+        ip: 10.42.1.2/24
+  - name: r0-r2
+    type: point_to_point
+    endpoints:
+    - r0
+    - r2
+    data_rate: 100Mbps
+    delay: 2ms
+    mtu: 1500
+    subnet: 10.42.2.0/24
+    interfaces:
+      r0:
+        ifname: r0-eth2
+        ip: 10.42.2.1/24
+      r2:
+        ifname: r2-uplink
+        ip: 10.42.2.2/24
+  lans:
+  - name: scada_lan
+    type: csma
+    members:
+    - r_scada
+    - s_scada
+    - scada
+    data_rate: 100Mbps
+    delay: 100us
+    mtu: 1500
+    subnet: 192.168.155.0/24
+    interfaces:
+      r_scada:
+        ifname: r_scada-lan0
+        ip: 192.168.155.254/24
+      scada:
+        ifname: scada-eth0
+        ip: 192.168.155.1/24
+        gateway: 192.168.155.254
+  - name: plc1_lan
+    type: csma
+    members:
+    - r1
+    - s1
+    - PLC1
+    data_rate: 100Mbps
+    delay: 100us
+    mtu: 1500
+    subnet: 192.168.101.0/24
+    interfaces:
+      r1:
+        ifname: r1-lan0
+        ip: 192.168.101.254/24
+      PLC1:
+        ifname: PLC1-eth0
+        ip: 192.168.101.1/24
+        gateway: 192.168.101.254
+  - name: plc2_lan
+    type: csma
+    members:
+    - r2
+    - s2
+    - PLC2
+    - mitm
+    data_rate: 100Mbps
+    delay: 100us
+    mtu: 1500
+    subnet: 192.168.102.0/24
+    interfaces:
+      r2:
+        ifname: r2-lan0
+        ip: 192.168.102.254/24
+      PLC2:
+        ifname: PLC2-eth0
+        ip: 192.168.102.1/24
+        gateway: 192.168.102.254
+      mitm:
+        ifname: mitm-eth0
+        ip: 192.168.102.100/24
+        gateway: 192.168.102.254
+  taps:
+  - endpoint: PLC1
+    tap_name: tap-pwr-plc1
+    mode: use_local
+    host_namespace: ns-power-plc1
+  - endpoint: PLC2
+    tap_name: tap-pwr-plc2
+    mode: use_local
+    host_namespace: ns-power-plc2
+  - endpoint: scada
+    tap_name: tap-pwr-scada
+    mode: use_local
+    host_namespace: ns-power-scada
+  - endpoint: mitm
+    tap_name: tap-pwr-mitm
+    mode: use_local
+    host_namespace: ns-power-mitm
+  applications:
+  - name: scada_to_plc1
+    src: scada
+    dst: PLC1
+    protocol: tcp
+    dst_port: 502
+  - name: scada_to_plc2
+    src: scada
+    dst: PLC2
+    protocol: tcp
+    dst_port: 502
+  attack_points:
+  - name: controller_path
+    type: path
+    targets:
+    - scada
+    - r0
+    - r2
+    - PLC2
+attacks:
+  enabled: true
+  scenarios:
+  - name: power_voltage_bias
+    enabled: true
+    type: modbus_mitm
+    trigger:
+      type: iteration_window
+      start_iteration: 3
+      end_iteration: 6
+    attacker:
+      endpoint: mitm
+      namespace: ns-power-mitm
+      ip: 192.168.102.100
+    intercept:
+      source: scada
+      targets:
+      - PLC2
+      protocol: modbus_tcp
+      port: 502
+      listen_port_base: 15030
+      redirect: iptables_output_dnat
+    rules:
+    - name: bias_voltage_downlink
+      target: PLC2
+      variable: PLC1_V_CONTROL
+      direction: request
+      function_codes:
+      - 16
+      operation: add
+      value: -0.15
+      window:
+        start_after_sec: 0.0
+
+reporting:
+  key_variables: [PLC1.PLC1_V_CONTROL, PLC1.PLC1_P_LOAD]

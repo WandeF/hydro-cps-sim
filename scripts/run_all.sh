@@ -74,7 +74,10 @@ try:
         raise ValueError("output_path must be a dedicated output directory")
     import yaml
     import pymodbus
-    from epynet.epanet2 import EPANET2
+    from src.core.config import load_yaml
+    from src.physics.config import physics_backend
+    from src.physics.factory import check_physics_dependencies
+    check_physics_dependencies(physics_backend(load_yaml(config)))
 except (ValueError, ImportError) as exc:
     raise SystemExit(f"[ERROR] {exc}")
 PY
@@ -249,7 +252,7 @@ run_closed_loop() {
   RUNTIME_STARTED=1
   sudo -n "$PYTHON_BIN" -m src.runtime.persistent_closed_loop \
     --config "$CONFIG" --iterations "$ITERATIONS" --python "$PYTHON_BIN" \
-    --physics-mode dhalsim_epynet --init-style dhalsim \
+    --physics-mode "$PHYSICS_BACKEND" --init-style "$PHYSICS_INIT_STYLE" \
     --poll-interval "$POLL_INTERVAL" --logic-wait "$LOGIC_WAIT" \
     --scada-modbus-workers "$SCADA_MODBUS_WORKERS"
 }

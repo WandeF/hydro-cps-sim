@@ -55,16 +55,19 @@ class RuntimeConfig:
     plcs: dict[str, PlcRuntime]
     initial_state: dict[str, float]
     actuator_initial_state: dict[str, bool]
-    hydraulic_timestep: int
+    hydraulic_timestep: float
     iterations: int
 
     def to_summary_dict(self) -> dict[str, Any]:
+        from src.physics.config import physics_backend
         return {
             "config": str(self.config_path),
             "output_dir": str(self.output_dir),
             "st_dir": str(self.st_dir),
             "iterations": self.iterations,
             "hydraulic_timestep": self.hydraulic_timestep,
+            "physics_backend": physics_backend(self.raw),
+            "timestep": self.hydraulic_timestep,
             "plcs": {
                 name: {
                     "namespace": plc.namespace,
@@ -172,7 +175,7 @@ def _endpoint_ips(cfg: dict[str, Any]) -> dict[str, str]:
 
 def _initial_physical_state(cfg: dict[str, Any]) -> dict[str, float]:
     state: dict[str, float] = {}
-    for k, v in (cfg.get("initial_tank_values") or {}).items():
+    for k, v in {**(cfg.get("initial_tank_values") or {}), **(cfg.get("initial_state") or {})}.items():
         try:
             state[str(k)] = float(v)
         except Exception:
@@ -201,7 +204,11 @@ def _initial_actuators(cfg: dict[str, Any]) -> dict[str, bool]:
     return states
 
 
-def _hydraulic_timestep(cfg: dict[str, Any]) -> int:
+def _hydraulic_timestep(cfg: dict[str, Any]) -> float:
+    from src.physics.config import physics_timestep
+    timestep = physics_timestep(cfg)
+    if timestep is not None:
+        return int(timestep) if timestep.is_integer() else timestep
     for item in cfg.get("time", []) or []:
         if not isinstance(item, dict):
             continue
@@ -217,6 +224,12 @@ def _hydraulic_timestep(cfg: dict[str, Any]) -> int:
 def load_runtime_config(config_path: Path | str) -> RuntimeConfig:
     config_path = Path(config_path).resolve()
     cfg = load_yaml(config_path)
+    from src.physics.config import physics_backend, physics_init_style, physics_timestep
+    backend = physics_backend(cfg)
+    if backend != "dhalsim_epynet" and physics_timestep(cfg) is None:
+        raise ValueError("Non-water backends require an explicit physics.timestep")
+    physics_timestep(cfg)
+    physics_init_style(cfg)
     output_dir = _resolve_output_dir(config_path, cfg)
     st_dir = output_dir / "st"
     endpoint_info = _endpoint_table(cfg)

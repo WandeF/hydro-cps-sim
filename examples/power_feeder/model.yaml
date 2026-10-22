@@ -1,0 +1,18 @@
+# Quasi-static, four-bus 20 kV radial feeder; all powers are MW / MVAr.
+sn_mva: 1.0
+buses:
+  - {name: grid, vn_kv: 20.0}
+  - {name: feeder, vn_kv: 20.0}
+  - {name: control, vn_kv: 20.0}
+  - {name: flexible, vn_kv: 20.0}
+ext_grids:
+  - {name: utility, bus: grid, vm_pu: 1.02}
+lines:
+  - {name: upstream, from_bus: grid, to_bus: feeder, length_km: 3.0, r_ohm_per_km: 0.642, x_ohm_per_km: 0.083, c_nf_per_km: 0.0, max_i_ka: 0.2}
+  - {name: feeder_line, from_bus: feeder, to_bus: control, length_km: 3.0, r_ohm_per_km: 0.642, x_ohm_per_km: 0.083, c_nf_per_km: 0.0, max_i_ka: 0.2}
+  - {name: load_branch, from_bus: control, to_bus: flexible, length_km: 0.2, r_ohm_per_km: 0.642, x_ohm_per_km: 0.083, c_nf_per_km: 0.0, max_i_ka: 0.2}
+loads:
+  - {name: essential, bus: control, p_mw: 0.2, q_mvar: 0.04}
+  - {name: flexible_load, bus: flexible, p_mw: 0.8, q_mvar: 0.16}
+switches:
+  - {name: load_breaker, bus: control, element: load_branch, et: l, closed: true, type: LBS}

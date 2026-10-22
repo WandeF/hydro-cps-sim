@@ -88,6 +88,15 @@ def export_physics(rt, runtime_dir: Path, reports_csv_dir: Path) -> Path:  # typ
     return out
 
 
+def export_physics_state(rt, runtime_dir: Path, reports_csv_dir: Path) -> Path:
+    """Add time/backend metadata without changing historical physics.csv."""
+    from src.io.physics import state_columns, state_row
+    out = reports_csv_dir / "physics_state.csv"
+    rows = [state_row(rt, snapshot) for snapshot in _load_physics_snapshots(runtime_dir)]
+    _write_csv(out, rows, state_columns(rt))
+    return out
+
+
 def export_actuator_state(runtime_dir: Path, reports_csv_dir: Path) -> Path:
     raw_rows = _read_jsonl(runtime_dir / "raw" / "actuator_state.jsonl")
     if not raw_rows:
@@ -128,7 +137,9 @@ def _is_local_scada_observation(row: dict[str, Any]) -> bool:
     return owner == plc
 
 
-def export_scada_observed(runtime_dir: Path, reports_csv_dir: Path) -> list[Path]:
+def export_scada_observed(runtime_dir: Path, reports_csv_dir: Path, *, key_variables: list[str] | None = None) -> list[Path]:
+    if key_variables is not None and (not isinstance(key_variables, list) or any(not isinstance(key, str) for key in key_variables)):
+        raise ValueError("reporting.key_variables must be a list of variable names")
     raw_rows = _load_scada_observed(runtime_dir)
     normalized: list[dict[str, Any]] = []
     for row in raw_rows:
@@ -170,7 +181,7 @@ def export_scada_observed(runtime_dir: Path, reports_csv_dir: Path) -> list[Path
     _write_csv(wide_path, wide_rows, wide_cols)
 
     key_cols = ["iteration"] + [
-        col for col in wide_cols[1:] if re.fullmatch(r"PLC\d+\.PLC\d+_T\d+", col)
+        col for col in wide_cols[1:] if (col in key_variables if key_variables is not None else re.fullmatch(r"PLC\d+\.PLC\d+_T\d+", col))
     ]
     key_rows = [{col: row.get(col, "") for col in key_cols} for row in wide_rows]
     key_path = reports_csv_dir / "scada_observed_key.csv"
@@ -342,8 +353,10 @@ def export_all(config: Path, runtime_dir: Path | None = None, reports_dir: Path 
 
     outputs: dict[str, Path] = {}
     outputs["physics"] = export_physics(rt, runtime_dir, reports_csv_dir)
+    outputs["physics_state"] = export_physics_state(rt, runtime_dir, reports_csv_dir)
     outputs["actuator_state"] = export_actuator_state(runtime_dir, reports_csv_dir)
-    for path in export_scada_observed(runtime_dir, reports_csv_dir):
+    for path in export_scada_observed(runtime_dir, reports_csv_dir,
+                                     key_variables=rt.raw.get("reporting", {}).get("key_variables")):
         outputs[path.stem] = path
     outputs["attack_events"] = export_attack_events(runtime_dir, reports_csv_dir)
     outputs["attack_schedule"] = export_attack_schedule(runtime_dir, reports_csv_dir)

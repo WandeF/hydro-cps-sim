@@ -30,7 +30,8 @@ from typing import Any
 
 from src.io.csv import append_jsonl, append_row, csv_dir, json_dir, raw_dir
 from src.io.dhalsim import write_physics_row
-from src.physics.engine import PhysicsEngine
+from src.physics.factory import create_physics_adapter
+from src.physics.config import BACKENDS, ALIASES, physics_backend, physics_init_style
 from src.core.config import load_runtime_config, read_json, write_json
 from src.sync.filesystem import DEFAULT_POLL_INTERVAL, clear_ready_files, marker_path, touch_marker
 
@@ -584,7 +585,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", required=True, type=Path)
     p.add_argument("--iterations", type=int, default=None)
     p.add_argument("--python", dest="python_bin", default=sys.executable, help="Python executable visible inside namespaces")
-    p.add_argument("--physics-mode", choices=["dhalsim_epynet", "epynet"], default="dhalsim_epynet")
+    p.add_argument("--physics-mode", choices=["auto", *BACKENDS, *ALIASES], default="auto")
     p.add_argument("--modbus-port", type=int, default=502)
     p.add_argument("--unit-id", type=int, default=1)
     p.add_argument("--timeout", type=float, default=2.0)
@@ -596,8 +597,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--init-style",
         choices=["dhalsim", "current"],
-        default="dhalsim",
-        help="Initialization/iteration semantics. 'dhalsim' writes row 0 all-zero and row 1 configured initial state; 'current' keeps the old physics_0000 t=0 snapshot behavior.",
+        default=None,
+        help="Initialization/iteration semantics. Defaults to physics.init_style or the selected adapter default. 'dhalsim' preserves water bootstrap rows; 'current' starts at a solved time-zero state.",
     )
     p.add_argument("--no-bootstrap-preload", action="store_true", help="Disable cycle-0 PLC memory preload")
     p.add_argument("--bootstrap-wait", type=float, default=0.30, help="Seconds to wait after bootstrap preload before releasing the initial physics marker")
@@ -631,7 +632,12 @@ def main() -> int:
     clear_ready_files(sync_dir)
     write_json(json_dir(runtime_dir) / "runtime_map.json", rt.to_summary_dict())
 
-    physics = PhysicsEngine(rt, mode=args.physics_mode)
+    physics = create_physics_adapter(rt, mode=args.physics_mode)
+    physics.initialize()
+    args.init_style = args.init_style or physics_init_style(rt.raw, physics_backend(rt.raw, args.physics_mode))
+    if args.init_style == "dhalsim" and physics.default_init_style != "dhalsim":
+        physics.close()
+        raise ValueError("DHALSIM initialization is only available for the EPANET adapter")
     actuator_state = dict(rt.actuator_initial_state)
 
     attack_scheduling_enabled = bool(_enabled_attack_scenarios(rt.raw))
@@ -651,7 +657,8 @@ def main() -> int:
     print("=" * 80)
 
     if args.dry_run:
-        print("[DRY-RUN] Runtime map and sync directory prepared only.")
+        print("[DRY-RUN] Runtime map prepared and selected physics backend initialized; no control/network execution.")
+        physics.close()
         return 0
 
     processes: dict[str, subprocess.Popen] = {}
@@ -797,7 +804,7 @@ def main() -> int:
             timing["physics_value_count"] = len(next_physics_snapshot.get("values", {}) or {})
             timing["actuator_count"] = len(actuator_state)
             print(
-                f"[CYCLE {i}] EPANET step actuator_state_{i:04d} -> physics_{i + 1:04d} "
+                f"[CYCLE {i}] Physics step actuator_state_{i:04d} -> physics_{i + 1:04d} "
                 f"backend={next_physics_snapshot.get('backend')} "
                 f"values={len(next_physics_snapshot.get('values', {}))} -> {output_physics_path}"
             )

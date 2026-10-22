@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from src.core.config import load_yaml
+from src.physics.config import physics_backend, physics_init_style, physics_timestep
 from src.network.network_sh_generation import _endpoint_entries, _linux_ifname, _safe_lower
 
 
@@ -24,6 +25,8 @@ def _resolve_path(config_path: Path, value: Any, *, default: str | None = None) 
 
 def _resolve_output_dir(config_path: Path, value: Any) -> Path:
     p = _resolve_path(config_path, value, default="output")
+    if value not in (None, "") and not Path(str(value)).expanduser().is_absolute():
+        return p
     if p.exists():
         return p
     local_output = (config_path.parent / "output").resolve()
@@ -39,6 +42,9 @@ def main() -> int:
 
     config_path = args.config.expanduser().resolve()
     cfg = load_yaml(config_path)
+    backend = physics_backend(cfg)
+    physics_timestep(cfg)
+    init_style = physics_init_style(cfg, backend)
     output_dir = _resolve_output_dir(config_path, cfg.get("output_path"))
     openplc_path = _resolve_path(config_path, cfg.get("openplc_path"), default="../OpenPLC_v3")
     ns3_path = _resolve_path(config_path, cfg.get("ns3_path"), default="../ns-3-dev-git")
@@ -46,6 +52,8 @@ def main() -> int:
 
     values = {
         "CONFIG_ABS": str(config_path),
+        "PHYSICS_BACKEND": backend,
+        "PHYSICS_INIT_STYLE": init_style,
         "OUTPUT_DIR": str(output_dir),
         "OPENPLC_PATH": str(openplc_path),
         "NS3_PATH": str(ns3_path),
