@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from src.core.config import load_runtime_config
-from src.io.dhalsim import dhalsim_tag_columns, snapshot_to_dhalsim_row
+from src.io.physics_export import flat_columns, flat_row, signal_rows, uses_legacy_format
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -79,9 +79,9 @@ def _load_physics_snapshots(runtime_dir: Path) -> list[dict[str, Any]]:
 
 def export_physics(rt, runtime_dir: Path, reports_csv_dir: Path) -> Path:  # type: ignore[no-untyped-def]
     rows: list[dict[str, Any]] = []
-    columns = ["iteration"] + dhalsim_tag_columns(rt)
+    columns = [col for col in flat_columns(rt) if col != "timestamp"]
     for snapshot in _load_physics_snapshots(runtime_dir):
-        row = snapshot_to_dhalsim_row(rt, snapshot)
+        row = flat_row(rt, snapshot)
         rows.append({col: (_fmt(row.get(col)) if col != "iteration" else row.get(col, "")) for col in columns})
     out = reports_csv_dir / "physics.csv"
     _write_csv(out, rows, columns)
@@ -140,6 +140,7 @@ def _is_local_scada_observation(row: dict[str, Any]) -> bool:
 def export_scada_observed(runtime_dir: Path, reports_csv_dir: Path, *, key_variables: list[str] | None = None) -> list[Path]:
     if key_variables is not None and (not isinstance(key_variables, list) or any(not isinstance(key, str) for key in key_variables)):
         raise ValueError("reporting.key_variables must be a list of variable names")
+    from src.io.legacy_export import legacy_key_variable
     raw_rows = _load_scada_observed(runtime_dir)
     normalized: list[dict[str, Any]] = []
     for row in raw_rows:
@@ -181,7 +182,7 @@ def export_scada_observed(runtime_dir: Path, reports_csv_dir: Path, *, key_varia
     _write_csv(wide_path, wide_rows, wide_cols)
 
     key_cols = ["iteration"] + [
-        col for col in wide_cols[1:] if (col in key_variables if key_variables is not None else re.fullmatch(r"PLC\d+\.PLC\d+_T\d+", col))
+        col for col in wide_cols[1:] if (col in key_variables if key_variables is not None else legacy_key_variable(col))
     ]
     key_rows = [{col: row.get(col, "") for col in key_cols} for row in wide_rows]
     key_path = reports_csv_dir / "scada_observed_key.csv"
@@ -354,9 +355,20 @@ def export_all(config: Path, runtime_dir: Path | None = None, reports_dir: Path 
     outputs: dict[str, Path] = {}
     outputs["physics"] = export_physics(rt, runtime_dir, reports_csv_dir)
     outputs["physics_state"] = export_physics_state(rt, runtime_dir, reports_csv_dir)
+    samples = [row for snapshot in _load_physics_snapshots(runtime_dir) for row in signal_rows(snapshot)]
+    outputs['physics_signals'] = reports_csv_dir/'physics_signals.csv'
+    _write_csv(outputs['physics_signals'], samples, ['iteration','sim_time','backend','signal','direction',
+               'value','dtype','unit','valid','quality','measurement_time_s','input_effective_time_s'])
+    schema_path = runtime_dir/'json/signal_schema.json'
+    if schema_path.exists():
+        import shutil
+        outputs['signal_schema'] = reports_dir/'signal_schema.json'
+        shutil.copyfile(schema_path, outputs['signal_schema'])
     outputs["actuator_state"] = export_actuator_state(runtime_dir, reports_csv_dir)
     for path in export_scada_observed(runtime_dir, reports_csv_dir,
-                                     key_variables=rt.raw.get("reporting", {}).get("key_variables")):
+                                     key_variables=rt.raw.get("reporting", {}).get("key_variables",
+                                         None if uses_legacy_format(rt) else
+                                         [f"{plc.name}.{var.name}" for plc in rt.plcs.values() for var in plc.md_vars.values()])):
         outputs[path.stem] = path
     outputs["attack_events"] = export_attack_events(runtime_dir, reports_csv_dir)
     outputs["attack_schedule"] = export_attack_schedule(runtime_dir, reports_csv_dir)

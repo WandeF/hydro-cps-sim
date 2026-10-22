@@ -229,3 +229,85 @@ class PandapowerAdapter(PhysicsAdapter):
         self.available = False
         self.closed = True
         self.net = None
+
+
+# UPSI adapter. The historical step API above remains import-compatible.
+from types import SimpleNamespace
+from src.physics.base import PhysicsBackend
+from src.physics.types import SignalSpec, StepResult
+
+
+class PandapowerBackend(PhysicsBackend):
+    def __init__(self, config):
+        self.config = config
+        self.adapter = None
+        self.closed = False
+        self.result = None
+        self.sensors, self.commands = {}, {}
+        self.ports = {}
+        units = {'vm_pu':'pu', 'va_degree':'degree', 'p_mw':'MW', 'q_mvar':'Mvar',
+                 'loading_percent':'%', 'pl_mw':'MW', 'ql_mvar':'Mvar', 'i_ka':'kA',
+                 'i_from_ka':'kA', 'i_to_ka':'kA', 'vm_from_pu':'pu', 'vm_to_pu':'pu',
+                 'va_from_degree':'degree', 'va_to_degree':'degree', 'p_from_mw':'MW',
+                 'p_to_mw':'MW', 'q_from_mvar':'Mvar', 'q_to_mvar':'Mvar'}
+        for group, direction in (('observations','output'), ('commands','input')):
+            for name, item in config.options['signals'][group].items():
+                port = item['port']
+                table, rest = port.split('.', 1)
+                element, column = rest.rsplit('.', 1)
+                spec = {'table':table, 'element':element, 'column':column}
+                if direction == 'output':
+                    if column not in units:
+                        raise ValueError(f'Unsupported pandapower result column metadata: {column}')
+                    old = config.options.get('sensors', {}).get(name, {})
+                    if 'missing' in item or 'missing' in old:
+                        spec['missing'] = item.get('missing', old.get('missing'))
+                    self.sensors[port] = spec
+                else:
+                    self.commands[port] = spec
+                self.ports[port] = SignalSpec(port, direction, 'float' if direction == 'output' else 'bool',
+                                              units.get(column, '1') if direction == 'output' else '1')
+
+    def describe(self):
+        return {'signals':dict(self.ports), 'timing':'target', 'model_kind':'quasi_static_ac_power_flow'}
+
+    def _capture(self, snapshot):
+        quality = {p: 'good' for p in self.sensors}
+        for port,spec in self.sensors.items():
+            if spec.get('missing') == 'zero_if_unsupplied':
+                index = self.adapter._index('bus', spec['element'])
+                if index in self.adapter.unsupplied: quality[port] = 'unsupplied'
+        return StepResult(snapshot['sim_time'], dict(snapshot['values']), dict(snapshot['actuators_applied']),
+                          diagnostics={'solver_converged':snapshot['solver_converged'],
+                                       'unsupplied_buses':snapshot['unsupplied_buses']}, quality=quality)
+
+    def initialize(self):
+        if self.closed: raise RuntimeError('Physics backend is closed')
+        if self.result is None:
+            options = dict(self.config.options)
+            options.update(model_file=str(self.config.model_path()), timestep=self.config.step_seconds,
+                           sensors=self.sensors, actuators=self.commands)
+            options.pop('timing', None)
+            cfg = SimpleNamespace(config_path=self.config.config_path, output_dir=self.config.work_dir.parent,
+                raw={'physics':options, 'plcs':[{'sensors':list(self.sensors)}]},
+                hydraulic_timestep=self.config.step_seconds, actuator_initial_state=dict(self.config.initial_inputs))
+            self.adapter = PandapowerAdapter(cfg, self.config.work_dir)
+            self.result = self._capture(self.adapter.initialize())
+        import copy
+        return copy.deepcopy(self.result)
+
+    def advance(self, until_s, inputs):
+        if self.closed or self.result is None: raise RuntimeError('Physics backend is not initialized')
+        duration = until_s-self.result.time_s
+        if duration <= 0: raise ValueError('Target time must increase')
+        try:
+            self.result = self._capture(self.adapter.step(inputs, dt=duration))
+        except Exception:
+            self.close()
+            raise
+        import copy
+        return copy.deepcopy(self.result)
+
+    def close(self):
+        if self.adapter is not None: self.adapter.close()
+        self.closed = True

@@ -1,4 +1,6 @@
-# Modular physics validation
+# Initial adapter validation — 4dd6b2b
+
+This record covers the initial adapter implementation. The current UPSI framework, C-Town 100-round regression and independent third adapter are documented in [UPSI validation](upsi-validation.md).
 
 ## Environment
 

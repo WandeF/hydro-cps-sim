@@ -98,7 +98,7 @@ bash scripts/run_all.sh --config examples/c_town/config_mitm_plc4.yaml --logic-w
 
 ## 模块化物理仿真与电网示例
 
-开发分支增加了可配置的物理接口和可选的 pandapower 后端，原有 C-Town 配置继续使用 EPANET。接口与配置见[模块化物理仿真](docs/modular-physics.md)，电网示例见[power_feeder](examples/power_feeder/README.md)，实际验证范围见[验证记录](docs/modular-physics-validation.md)。
+UPSI 统一物理信号的类型、单位与时间信息，通过配置加载仿真器插件，原有 C-Town 配置继续使用 EPANET。详见 [UPSI 接口与配置](docs/upsi.md)、[第三方适配器 SDK](docs/adapter-sdk.md)、[电网示例](examples/power_feeder/README.md)、独立的[恒温箱示例](examples/thermal_box/README.md)和[验证记录](docs/upsi-validation.md)。
 
 使用 `python -m pip install -r requirements-power.txt` 安装可选依赖。在具有 sudo 权限的交互终端中，可运行基线、透明代理与 MITM 三组实验：
 

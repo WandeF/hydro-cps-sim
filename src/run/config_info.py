@@ -45,6 +45,8 @@ def main() -> int:
     backend = physics_backend(cfg)
     physics_timestep(cfg)
     init_style = physics_init_style(cfg, backend)
+    from src.physics.normalization import normalize_physics
+    normalize_physics(cfg, config_path)
     output_dir = _resolve_output_dir(config_path, cfg.get("output_path"))
     openplc_path = _resolve_path(config_path, cfg.get("openplc_path"), default="../OpenPLC_v3")
     ns3_path = _resolve_path(config_path, cfg.get("ns3_path"), default="../ns-3-dev-git")

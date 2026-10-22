@@ -29,9 +29,8 @@ from pathlib import Path
 from typing import Any
 
 from src.io.csv import append_jsonl, append_row, csv_dir, json_dir, raw_dir
-from src.io.dhalsim import write_physics_row
-from src.physics.factory import create_physics_adapter
-from src.physics.config import BACKENDS, ALIASES, physics_backend, physics_init_style
+from src.io.physics_export import write_runtime_physics
+from src.physics.session import PhysicsSession
 from src.core.config import load_runtime_config, read_json, write_json
 from src.sync.filesystem import DEFAULT_POLL_INTERVAL, clear_ready_files, marker_path, touch_marker
 
@@ -202,8 +201,8 @@ def stop_daemons(processes: dict[str, subprocess.Popen], log_handles: list[Any],
 
 
 def _write_physics_csv(runtime_dir: Path, rt, snapshot: dict[str, Any], *, filename: str = "physics.csv") -> None:  # type: ignore[no-untyped-def]
-    """Write simulator state in flat DHALSIM-compatible CSV format."""
-    write_physics_row(runtime_dir, rt, snapshot, filename=filename)
+    """Write generic state tables and the configured compatibility view."""
+    write_runtime_physics(runtime_dir, rt, snapshot, filename=filename)
 
 
 def _write_actuator_state_csv(runtime_dir: Path, iteration: int, actuator_state: dict[str, bool]) -> None:
@@ -585,7 +584,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", required=True, type=Path)
     p.add_argument("--iterations", type=int, default=None)
     p.add_argument("--python", dest="python_bin", default=sys.executable, help="Python executable visible inside namespaces")
-    p.add_argument("--physics-mode", choices=["auto", *BACKENDS, *ALIASES], default="auto")
+    p.add_argument("--physics-mode", default="auto")
     p.add_argument("--modbus-port", type=int, default=502)
     p.add_argument("--unit-id", type=int, default=1)
     p.add_argument("--timeout", type=float, default=2.0)
@@ -632,12 +631,13 @@ def main() -> int:
     clear_ready_files(sync_dir)
     write_json(json_dir(runtime_dir) / "runtime_map.json", rt.to_summary_dict())
 
-    physics = create_physics_adapter(rt, mode=args.physics_mode)
-    physics.initialize()
-    args.init_style = args.init_style or physics_init_style(rt.raw, physics_backend(rt.raw, args.physics_mode))
-    if args.init_style == "dhalsim" and physics.default_init_style != "dhalsim":
+    physics = PhysicsSession(rt, mode=args.physics_mode, init_style=args.init_style)
+    args.init_style = physics.config.options['init_style']
+    try:
+        physics.validate_transport()
+    except Exception:
         physics.close()
-        raise ValueError("DHALSIM initialization is only available for the EPANET adapter")
+        raise
     actuator_state = dict(rt.actuator_initial_state)
 
     attack_scheduling_enabled = bool(_enabled_attack_scenarios(rt.raw))
@@ -667,29 +667,13 @@ def main() -> int:
     timing_rows: list[dict[str, Any]] = []
 
     try:
-        if args.init_style == "dhalsim":
-            # DHALSIM exports two initialization rows before the first solved
-            # hydraulic state: row 0 is all-zero bootstrap, row 1 is configured
-            # tank/actuator initial state.  Row 0 is persisted for CSV alignment
-            # only; it is not released to PLC/SCADA to avoid false zero inputs.
-            zero_snapshot = physics.dhalsim_zero_snapshot(iteration=0)
-            zero_path = persist_physics_snapshot(runtime_dir, rt, 0, zero_snapshot)
-            print(
-                f"[INIT] physics_0000 DHALSIM dummy backend={zero_snapshot.get('backend')} "
-                f"values={len(zero_snapshot.get('values', {}))} -> {zero_path}"
-            )
-
-            initial_iteration = 1
-            first_control_iteration = 1
-            final_physics_iteration = args.iterations
-            control_iterations = max(0, final_physics_iteration - first_control_iteration)
-            initial_snapshot = physics.dhalsim_initial_snapshot(iteration=initial_iteration)
-        else:
-            initial_iteration = 0
-            first_control_iteration = 0
-            final_physics_iteration = args.iterations
-            control_iterations = max(0, final_physics_iteration - first_control_iteration)
-            initial_snapshot = physics.current_snapshot(iteration=initial_iteration)
+        for record in physics.bootstrap_records:
+            persist_physics_snapshot(runtime_dir, rt, record['iteration'], record)
+        initial_iteration = physics.start_cycle
+        first_control_iteration = initial_iteration
+        final_physics_iteration = args.iterations
+        control_iterations = max(0, final_physics_iteration - first_control_iteration)
+        initial_snapshot = physics.initialize()
 
         if attack_scheduling_enabled:
             # Bring MITM proxies and DNAT rules online before the SCADA daemon starts.
@@ -790,7 +774,7 @@ def main() -> int:
 
             # 5) Apply u_i to the plant interval that produces x_{i+1}.
             physics_t0 = time.monotonic()
-            next_physics_snapshot = physics.step(actuator_state, iteration=i + 1)
+            next_physics_snapshot = physics.advance(actuator_state, iteration=i + 1)
             output_physics_path = persist_physics_snapshot(runtime_dir, rt, i + 1, next_physics_snapshot)
             if attack_scheduling_enabled:
                 _sync_attacks_for_iteration(args, project_root, runtime_dir, i + 1)

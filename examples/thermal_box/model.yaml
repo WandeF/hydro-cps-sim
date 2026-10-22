@@ -1,0 +1,6 @@
+ambient_c: 18.0
+initial_c: 19.0
+loss_per_s: 0.1
+heater_c_per_s: 0.8
+heater_w: 800.0
+input_dtype: bool

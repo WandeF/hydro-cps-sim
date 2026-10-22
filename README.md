@@ -98,7 +98,7 @@ Start with `physics.csv`, `actuator_state.csv` and `scada_observed_*.csv` to com
 
 ## Modular physics and power feeder
 
-The development branch adds a configurable physics interface and an optional pandapower backend. Existing C-Town configurations keep their EPANET behavior. See [Modular physics](docs/modular-physics.md), the [power feeder example](examples/power_feeder/README.md) and the [validation status](docs/modular-physics-validation.md).
+UPSI provides typed signals, explicit units and physical time, and configuration-driven simulator plugins. Existing C-Town scenarios keep their EPANET behavior. See [UPSI](docs/upsi.md), the [adapter SDK](docs/adapter-sdk.md), the [power feeder](examples/power_feeder/README.md), the independent [thermal box](examples/thermal_box/README.md) and [validation results](docs/upsi-validation.md).
 
 Install the optional dependencies with `python -m pip install -r requirements-power.txt`. From an interactive terminal with sudo access, run the baseline, transparent-proxy and MITM cases with:
 

@@ -19,4 +19,6 @@ Run as a normal user in an interactive terminal with sudo available. This execut
 
 The baseline keeps the 0.8 MW flexible load connected. A voltage below 0.95 pu opens its breaker; reconnection requires voltage above 1.03 pu. Output folders are separate per case. Re-running a case replaces its generated runtime and reports.
 
-The adapter solves quasi-static AC power flow, not electrical transients. Full-loop results and reproduction commands are recorded in [the validation report](../../docs/modular-physics-validation.md).
+The adapter solves quasi-static AC power flow, not electrical transients. Full-loop results and reproduction commands are recorded in [the validation report](../../docs/upsi-validation.md).
+
+`config_v2.yaml` runs the same baseline model using the explicit UPSI model, timing and signal schema. Its output is `output/schema_v2/`.

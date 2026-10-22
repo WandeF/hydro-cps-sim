@@ -1,18 +1,19 @@
-"""Domain-independent physics adapter contract.
+"""UPSI lifecycle and the backwards-compatible step/snapshot API.
 
-Snapshots carry SI/engineering-unit values under configured, domain-neutral
-sensor tags. Actuator True means enabled/connected; model mappings own any
-inversion needed for a particular physical element.
+New integrations implement PhysicsBackend and exchange typed StepResult values.
+PhysicsAdapter preserves the earlier Python API for existing callers.
 """
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import Any, Mapping
+from src.physics.types import Scalar, StepResult
 
 Snapshot = dict[str, Any]
 
 
 class PhysicsAdapter(ABC):
+    """Deprecated step/snapshot API retained for existing Python callers."""
     default_init_style = "current"
 
     @abstractmethod
@@ -35,3 +36,27 @@ class PhysicsAdapter(ABC):
     @abstractmethod
     def close(self) -> None:
         """Release resources; safe to call repeatedly."""
+
+
+class PhysicsBackend(ABC):
+    """UPSI v2. Ports and scalar values have no PLC/Modbus representation.
+
+    Construction must not acquire solver resources. describe() is available
+    before initialize(). advance() reports actual simulator time, never wall time.
+    """
+
+    @abstractmethod
+    def describe(self) -> dict[str, Any]:
+        """Return signals: dict[str, SignalSpec] and timing: target|event_step."""
+
+    @abstractmethod
+    def initialize(self) -> StepResult:
+        """Return an idempotent StepResult at the initial physical time."""
+
+    @abstractmethod
+    def advance(self, until_s: float, inputs: Mapping[str, Scalar]) -> StepResult:
+        """Apply inputs at the current time and advance toward until_s."""
+
+    @abstractmethod
+    def close(self) -> None:
+        """Release resources. Safe before initialization and after failure."""

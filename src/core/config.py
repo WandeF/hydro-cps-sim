@@ -53,10 +53,15 @@ class RuntimeConfig:
     output_dir: Path
     st_dir: Path
     plcs: dict[str, PlcRuntime]
-    initial_state: dict[str, float]
-    actuator_initial_state: dict[str, bool]
+    initial_state: dict[str, Any]
+    actuator_initial_state: dict[str, Any]
     hydraulic_timestep: float
     iterations: int
+
+    @property
+    def timestep_seconds(self) -> float:
+        """Generic sampling interval; hydraulic_timestep remains a legacy alias."""
+        return self.hydraulic_timestep
 
     def to_summary_dict(self) -> dict[str, Any]:
         from src.physics.config import physics_backend
@@ -173,35 +178,35 @@ def _endpoint_ips(cfg: dict[str, Any]) -> dict[str, str]:
     return ips
 
 
-def _initial_physical_state(cfg: dict[str, Any]) -> dict[str, float]:
-    state: dict[str, float] = {}
-    for k, v in {**(cfg.get("initial_tank_values") or {}), **(cfg.get("initial_state") or {})}.items():
-        try:
-            state[str(k)] = float(v)
-        except Exception:
-            pass
-
-    # Provide defaults for all declared sensors so the first iteration is total.
-    for plc in cfg.get("plcs", []) or []:
-        if not isinstance(plc, dict):
-            continue
-        for s in plc.get("sensors", []) or []:
-            name = str(s)
-            state.setdefault(name, 0.0)
-    return state
+def _initial_physical_state(cfg: dict[str, Any]) -> dict[str, Any]:
+    if cfg.get('schema_version',1) == 1:
+        from src.physics.legacy.ctown_compat import legacy_initial_values
+        return legacy_initial_values(cfg)
+    from src.physics.types import SignalSpec
+    result = {}
+    for name,value in cfg.get('initial_state', {}).items():
+        mapping=cfg.get('physics', {}).get('signals', {}).get('observations', {}).get(name)
+        if mapping is None: raise ValueError(f'Unknown initial output signal: {name}')
+        spec={**mapping, **cfg.get('signals', {}).get(name, {})}
+        result[name]=SignalSpec(name,'output',spec['dtype'],spec.get('unit','1'),
+                                spec.get('minimum'),spec.get('maximum')).validate(value)
+    return result
 
 
-def _initial_actuators(cfg: dict[str, Any]) -> dict[str, bool]:
-    states: dict[str, bool] = {}
-    for item in cfg.get("actuators", []) or []:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name", ""))
-        if not name:
-            continue
-        raw = str(item.get("initial_state", "closed")).lower()
-        states[name] = raw in {"open", "true", "on", "1", "opened"}
-    return states
+def _initial_actuators(cfg: dict[str, Any]) -> dict[str, Any]:
+    if cfg.get('schema_version') == 2:
+        from src.physics.types import SignalSpec
+        states = {}
+        for item in cfg.get('actuators', []):
+            name = item['name']
+            mapping = cfg.get('physics', {}).get('signals', {}).get('commands', {}).get(name, {})
+            spec = {**mapping, **cfg.get('signals', {}).get(name, {})}
+            if 'dtype' not in spec: raise ValueError(f'{name} requires an explicit command dtype')
+            states[name] = SignalSpec(name,'input',spec['dtype'],spec.get('unit','1'),
+                                     spec.get('minimum'),spec.get('maximum')).validate(item['initial_state'])
+        return states
+    from src.physics.legacy.ctown_compat import legacy_initial_commands
+    return legacy_initial_commands(cfg)
 
 
 def _hydraulic_timestep(cfg: dict[str, Any]) -> float:
@@ -226,10 +231,13 @@ def load_runtime_config(config_path: Path | str) -> RuntimeConfig:
     cfg = load_yaml(config_path)
     from src.physics.config import physics_backend, physics_init_style, physics_timestep
     backend = physics_backend(cfg)
-    if backend != "dhalsim_epynet" and physics_timestep(cfg) is None:
-        raise ValueError("Non-water backends require an explicit physics.timestep")
+    from src.physics.registry import registration
+    if registration(backend).initialization != "dhalsim" and physics_timestep(cfg) is None:
+        raise ValueError("Backend requires an explicit physics.timing.step_seconds or legacy physics.timestep")
     physics_timestep(cfg)
     physics_init_style(cfg)
+    from src.physics.normalization import normalize_physics
+    normalize_physics(cfg, config_path)
     output_dir = _resolve_output_dir(config_path, cfg)
     st_dir = output_dir / "st"
     endpoint_info = _endpoint_table(cfg)
