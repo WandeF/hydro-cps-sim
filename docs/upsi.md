@@ -103,7 +103,7 @@ Legacy YAML continues to load. `normalization.py` translates its physical config
 
 `src.physics.engine.PhysicsEngine`, the old step adapters and `src.io.dhalsim` remain compatibility imports for existing Python callers. New integrations use `PhysicsBackend` and `PhysicsSession`.
 
-The old `physics.csv` layout remains available through `io/legacy_export.py`. Generic exports never derive flow from a name ending in `F`, invent zero values for missing measurements or assume tank-style SCADA variable names. The existing [power scenarios](../examples/power_feeder/README.md) also run through UPSI; [config_v2.yaml](../examples/power_feeder/config_v2.yaml) shows the explicit schema.
+The old `physics.csv` layout remains available through `io/legacy_export.py`. Generic exports never derive flow from a name ending in `F`, invent zero values for missing measurements or assume tank-style SCADA variable names. The [IEEE 33-bus benchmark](../examples/ieee33_bw/README.md) loads a whitelisted public pandapower case with stable paper-bus aliases and aggregate MW ports; its [validation record](ieee33-validation.md) includes real three-PLC attack experiments. The existing [power scenarios](../examples/power_feeder/README.md) also run through UPSI; [config_v2.yaml](../examples/power_feeder/config_v2.yaml) shows the explicit schema.
 
 ## Results
 

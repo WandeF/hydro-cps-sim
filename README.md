@@ -100,6 +100,8 @@ Start with `physics.csv`, `actuator_state.csv` and `scada_observed_*.csv` to com
 
 UPSI provides typed signals, explicit units and physical time, and configuration-driven simulator plugins. Existing C-Town scenarios keep their EPANET behavior. See [UPSI](docs/upsi.md), the [adapter SDK](docs/adapter-sdk.md), the [power feeder](examples/power_feeder/README.md), the independent [thermal box](examples/thermal_box/README.md) and [validation results](docs/upsi-validation.md).
 
+The [IEEE 33-bus example](examples/ieee33_bw/README.md) adds the public Baran–Wu model and three PLC experiment groups; see its [validation results](docs/ieee33-validation.md).
+
 Install the optional dependencies with `python -m pip install -r requirements-power.txt`. From an interactive terminal with sudo access, run the baseline, transparent-proxy and MITM cases with:
 
 ```bash
@@ -111,6 +113,7 @@ PYTHON_BIN="$(command -v python)" bash scripts/run_power_experiments.sh
 ```text
 examples/c_town/  Water model and example configurations
 examples/power_feeder/  Power feeder and three experiment configurations
+examples/ieee33_bw/     Baran–Wu IEEE 33-bus benchmark and CPS experiments
 docs/            Physics adapters and validation
 scripts/         Simulation runner
 src/             Hydraulic, control, SCADA, network, attack and I/O modules

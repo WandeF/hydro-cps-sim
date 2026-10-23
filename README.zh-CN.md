@@ -100,6 +100,8 @@ bash scripts/run_all.sh --config examples/c_town/config_mitm_plc4.yaml --logic-w
 
 UPSI 统一物理信号的类型、单位与时间信息，通过配置加载仿真器插件，原有 C-Town 配置继续使用 EPANET。详见 [UPSI 接口与配置](docs/upsi.md)、[第三方适配器 SDK](docs/adapter-sdk.md)、[电网示例](examples/power_feeder/README.md)、独立的[恒温箱示例](examples/thermal_box/README.md)和[验证记录](docs/upsi-validation.md)。
 
+论文标准电网实验见 [IEEE 33-bus](examples/ieee33_bw/README.md) 和[验证记录](docs/ieee33-validation.md)。
+
 使用 `python -m pip install -r requirements-power.txt` 安装可选依赖。在具有 sudo 权限的交互终端中，可运行基线、透明代理与 MITM 三组实验：
 
 ```bash
@@ -111,6 +113,7 @@ PYTHON_BIN="$(command -v python)" bash scripts/run_power_experiments.sh
 ```text
 examples/c_town/  水网模型与示例配置
 examples/power_feeder/  电网模型与三组实验配置
+examples/ieee33_bw/     IEEE 33 节点标准电网与 PLC 攻防实验
 docs/            物理接口与验证记录
 scripts/         仿真运行脚本
 src/             水力、控制、SCADA、网络、攻击与数据导出模块

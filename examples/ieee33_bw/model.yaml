@@ -1,0 +1,11 @@
+source: pandapower_builtin
+case: case33bw
+benchmark_mode: original
+source_citation: https://doi.org/10.1109/61.25627
+aliases:
+  BUS_02: {table: bus, paper_bus_number: 2}
+  BUS_18: {table: bus, paper_bus_number: 18}
+  BUS_24: {table: bus, paper_bus_number: 24}
+  BUS_33: {table: bus, paper_bus_number: 33}
+controlled_elements:
+  LOAD_BUS24: {table: load, bus_number: 24, field: in_service}

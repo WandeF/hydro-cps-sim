@@ -48,6 +48,13 @@ class PandapowerAdapter(PhysicsAdapter):
         self._names[table][name] = index
 
     def _build_model(self, pp: Any, model: dict[str, Any]) -> None:
+        self.provenance = None
+        if model.get("source") == "pandapower_builtin":
+            from src.physics.adapters.power_models import load_builtin
+            self.net, self._names, self.provenance = load_builtin(model)
+            return
+        if "source" in model:
+            raise ValueError("Unknown power model source")
         self.net = pp.create_empty_network(sn_mva=float(model.get("sn_mva", 1.0)))
         for item in model.get("buses", []):
             item = dict(item)
@@ -97,6 +104,11 @@ class PandapowerAdapter(PhysicsAdapter):
             if not isinstance(spec, dict):
                 raise ValueError(f"Invalid sensor mapping: {tag}")
             table = str(spec.get("table", ""))
+            if table == "metrics":
+                if spec.get("element") != "total" or spec.get("column") not in (
+                        "p_grid_mw", "p_loss_mw", "served_load_mw", "unserved_load_mw"):
+                    raise ValueError(f"Unknown derived power metric for {tag}")
+                continue
             if table not in ("res_bus", "res_line", "res_load", "res_ext_grid"):
                 raise ValueError(f"Unsupported result table for {tag}: {table}")
             self._index(table.removeprefix("res_"), spec.get("element"))
@@ -159,9 +171,14 @@ class PandapowerAdapter(PhysicsAdapter):
             if not self.net.converged:
                 raise RuntimeError("solver did not converge")
             self.unsupplied = set(pp.topology.unsupplied_buses(self.net))
+            from src.physics.adapters.power_models import power_metrics
+            self.metrics = power_metrics(self.net)
             state = {}
             for tag, spec in self._sensor_map.items():
                 table = spec["table"]
+                if table == "metrics":
+                    state[str(tag)] = self.metrics[spec["column"]]
+                    continue
                 index = self._index(table.removeprefix("res_"), spec["element"])
                 value = float(self.net[table].at[index, spec["column"]])
                 if not math.isfinite(value):
@@ -248,6 +265,7 @@ class PandapowerBackend(PhysicsBackend):
         units = {'vm_pu':'pu', 'va_degree':'degree', 'p_mw':'MW', 'q_mvar':'Mvar',
                  'loading_percent':'%', 'pl_mw':'MW', 'ql_mvar':'Mvar', 'i_ka':'kA',
                  'i_from_ka':'kA', 'i_to_ka':'kA', 'vm_from_pu':'pu', 'vm_to_pu':'pu',
+                 'p_grid_mw':'MW', 'p_loss_mw':'MW', 'served_load_mw':'MW', 'unserved_load_mw':'MW',
                  'va_from_degree':'degree', 'va_to_degree':'degree', 'p_from_mw':'MW',
                  'p_to_mw':'MW', 'q_from_mvar':'Mvar', 'q_to_mvar':'Mvar'}
         for group, direction in (('observations','output'), ('commands','input')):
@@ -277,9 +295,25 @@ class PandapowerBackend(PhysicsBackend):
             if spec.get('missing') == 'zero_if_unsupplied':
                 index = self.adapter._index('bus', spec['element'])
                 if index in self.adapter.unsupplied: quality[port] = 'unsupplied'
+        diagnostics = {'solver_converged':snapshot['solver_converged'],
+                       'unsupplied_buses':snapshot['unsupplied_buses']}
+        if self.adapter.provenance is not None:
+            a = self.adapter
+            diagnostics.update(power_metrics=dict(a.metrics), source=a.provenance['source'],
+                               input_tables_sha256=a.provenance['input_tables_sha256'],
+                               sampling='quasi_static_ac_power_flow',
+                               bus_voltages=[{'bus_number':m['paper_bus_number'],
+                                   'vm_pu':float(a.net.res_bus.at[m['index'], 'vm_pu'])
+                                       if m['index'] not in a.unsupplied else None,
+                                   'quality':'unsupplied' if m['index'] in a.unsupplied else 'good'}
+                                   for m in a.provenance['bus_id_map'].values()],
+                               controlled_loads={name:bool(a.net.load.at[idx,'in_service'])
+                                                 for name,idx in a._names['load'].items()})
+            for row in diagnostics['bus_voltages']:
+                if row['vm_pu'] is not None and not math.isfinite(row['vm_pu']):
+                    raise ValueError('Nonfinite energized bus voltage')
         return StepResult(snapshot['sim_time'], dict(snapshot['values']), dict(snapshot['actuators_applied']),
-                          diagnostics={'solver_converged':snapshot['solver_converged'],
-                                       'unsupplied_buses':snapshot['unsupplied_buses']}, quality=quality)
+                          diagnostics=diagnostics, quality=quality)
 
     def initialize(self):
         if self.closed: raise RuntimeError('Physics backend is closed')

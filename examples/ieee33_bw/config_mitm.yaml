@@ -1,0 +1,374 @@
+output_path: ../../output/ieee33_bw/mitm
+openplc_path: ../../../OpenPLC_v3
+ns3_path: ../../../ns-3-dev-git
+iterations: 100
+noise_scale: 0.0
+physics:
+  backend: pandapower
+  model:
+    path: model.yaml
+  timing:
+    mode: fixed_step
+    step_seconds: 1.0
+  signals:
+    observations:
+      V_BUS02:
+        port: res_bus.BUS_02.vm_pu
+        dtype: float
+        unit: pu
+      V_BUS18:
+        port: res_bus.BUS_18.vm_pu
+        dtype: float
+        unit: pu
+      V_BUS24:
+        port: res_bus.BUS_24.vm_pu
+        dtype: float
+        unit: pu
+      V_BUS33:
+        port: res_bus.BUS_33.vm_pu
+        dtype: float
+        unit: pu
+      P_LOAD24:
+        port: res_load.LOAD_BUS24.p_mw
+        dtype: float
+        unit: MW
+      P_GRID:
+        port: metrics.total.p_grid_mw
+        dtype: float
+        unit: MW
+      TOTAL_P_LOSS:
+        port: metrics.total.p_loss_mw
+        dtype: float
+        unit: MW
+      SERVED_LOAD_P:
+        port: metrics.total.served_load_mw
+        dtype: float
+        unit: MW
+      UNSERVED_LOAD_P:
+        port: metrics.total.unserved_load_mw
+        dtype: float
+        unit: MW
+    commands:
+      LOAD24_ENABLE:
+        port: load.LOAD_BUS24.in_service
+        dtype: bool
+        unit: '1'
+  solver:
+    algorithm: nr
+    max_iteration: 20
+    tolerance_mva: 1.0e-10
+actuators:
+- name: LOAD24_ENABLE
+  initial_state: true
+plcs:
+- name: PLC1
+  sensors:
+  - V_BUS02
+  actuators: []
+  controls: []
+- name: PLC2
+  sensors:
+  - V_BUS18
+  - V_BUS33
+  actuators: []
+  controls: []
+- name: PLC3
+  sensors:
+  - V_BUS24
+  - P_LOAD24
+  - P_GRID
+  - TOTAL_P_LOSS
+  - SERVED_LOAD_P
+  - UNSERVED_LOAD_P
+  actuators:
+  - LOAD24_ENABLE
+  controls:
+  - dependant: V_BUS02
+    actuator: LOAD24_ENABLE
+    type: below
+    value: 0.95
+    action: false
+  - dependant: V_BUS02
+    actuator: LOAD24_ENABLE
+    type: above
+    value: 1.03
+    action: true
+scada:
+  name: scada
+network_topology_type: complex
+network:
+  applications:
+  - dst: PLC1
+    dst_port: 502
+    name: scada_to_plc1
+    protocol: tcp
+    src: scada
+  - dst: PLC2
+    dst_port: 502
+    name: scada_to_plc2
+    protocol: tcp
+    src: scada
+  - dst: PLC3
+    dst_port: 502
+    name: scada_to_plc3
+    protocol: tcp
+    src: scada
+  ascii_trace: false
+  attack_points:
+  - name: controller_path
+    targets:
+    - scada
+    - r0
+    - r3
+    - PLC3
+    type: path
+  backbone_links:
+  - data_rate: 100Mbps
+    delay: 2ms
+    endpoints:
+    - r0
+    - r_scada
+    interfaces:
+      r0:
+        ifname: r0-eth-scada
+        ip: 10.42.255.1/24
+      r_scada:
+        ifname: r_scada-uplink
+        ip: 10.42.255.2/24
+    mtu: 1500
+    name: r0-r_scada
+    subnet: 10.42.255.0/24
+    type: point_to_point
+  - data_rate: 100Mbps
+    delay: 2ms
+    endpoints:
+    - r0
+    - r1
+    interfaces:
+      r0:
+        ifname: r0-eth1
+        ip: 10.42.1.1/24
+      r1:
+        ifname: r1-uplink
+        ip: 10.42.1.2/24
+    mtu: 1500
+    name: r0-r1
+    subnet: 10.42.1.0/24
+    type: point_to_point
+  - data_rate: 100Mbps
+    delay: 2ms
+    endpoints:
+    - r0
+    - r2
+    interfaces:
+      r0:
+        ifname: r0-eth2
+        ip: 10.42.2.1/24
+      r2:
+        ifname: r2-uplink
+        ip: 10.42.2.2/24
+    mtu: 1500
+    name: r0-r2
+    subnet: 10.42.2.0/24
+    type: point_to_point
+  - data_rate: 100Mbps
+    delay: 2ms
+    endpoints:
+    - r0
+    - r3
+    interfaces:
+      r0:
+        ifname: r0-eth2
+        ip: 10.42.3.1/24
+      r3:
+        ifname: r3-uplink
+        ip: 10.42.3.2/24
+    mtu: 1500
+    name: r0-r3
+    subnet: 10.42.3.0/24
+    type: point_to_point
+  backend: ns3
+  lans:
+  - data_rate: 100Mbps
+    delay: 100us
+    interfaces:
+      r_scada:
+        ifname: r_scada-lan0
+        ip: 192.168.155.254/24
+      scada:
+        gateway: 192.168.155.254
+        ifname: scada-eth0
+        ip: 192.168.155.1/24
+    members:
+    - r_scada
+    - s_scada
+    - scada
+    mtu: 1500
+    name: scada_lan
+    subnet: 192.168.155.0/24
+    type: csma
+  - data_rate: 100Mbps
+    delay: 100us
+    interfaces:
+      PLC1:
+        gateway: 192.168.101.254
+        ifname: PLC1-eth0
+        ip: 192.168.101.1/24
+      r1:
+        ifname: r1-lan0
+        ip: 192.168.101.254/24
+    members:
+    - r1
+    - s1
+    - PLC1
+    mtu: 1500
+    name: plc1_lan
+    subnet: 192.168.101.0/24
+    type: csma
+  - data_rate: 100Mbps
+    delay: 100us
+    interfaces:
+      PLC2:
+        gateway: 192.168.102.254
+        ifname: PLC2-eth0
+        ip: 192.168.102.1/24
+      r2:
+        ifname: r2-lan0
+        ip: 192.168.102.254/24
+    members:
+    - r2
+    - s2
+    - PLC2
+    mtu: 1500
+    name: plc2_lan
+    subnet: 192.168.102.0/24
+    type: csma
+  - data_rate: 100Mbps
+    delay: 100us
+    interfaces:
+      PLC3:
+        gateway: 192.168.103.254
+        ifname: PLC3-eth0
+        ip: 192.168.103.1/24
+      mitm:
+        gateway: 192.168.103.254
+        ifname: mitm-eth0
+        ip: 192.168.103.100/24
+      r3:
+        ifname: r3-lan0
+        ip: 192.168.103.254/24
+    members:
+    - r3
+    - s3
+    - PLC3
+    - mitm
+    mtu: 1500
+    name: plc3_lan
+    subnet: 192.168.103.0/24
+    type: csma
+  nodes:
+    endpoints:
+    - name: PLC1
+      namespace: ns-ieee-plc1
+      role: plc
+      tap: tap-ieee-plc1
+    - name: PLC2
+      namespace: ns-ieee-plc2
+      role: plc
+      tap: tap-ieee-plc2
+    - name: PLC3
+      namespace: ns-ieee-plc3
+      role: plc
+      tap: tap-ieee-plc3
+    - name: scada
+      namespace: ns-ieee-scada
+      role: scada
+      tap: tap-ieee-scada
+    - name: mitm
+      namespace: ns-ieee-mitm
+      role: attacker
+      tap: tap-ieee-mitm
+    routers:
+    - name: r0
+      role: core_router
+    - name: r_scada
+      role: edge_router
+    - name: r1
+      role: edge_router
+    - name: r2
+      role: edge_router
+    - name: r3
+      role: edge_router
+    switches:
+    - name: s_scada
+      role: bridge_switch
+    - name: s1
+      role: bridge_switch
+    - name: s2
+      role: bridge_switch
+    - name: s3
+      role: bridge_switch
+  pcap: false
+  routing: global
+  scheduler: realtime
+  taps:
+  - endpoint: PLC1
+    host_namespace: ns-ieee-plc1
+    mode: use_local
+    tap_name: tap-ieee-plc1
+  - endpoint: PLC2
+    host_namespace: ns-ieee-plc2
+    mode: use_local
+    tap_name: tap-ieee-plc2
+  - endpoint: PLC3
+    host_namespace: ns-ieee-plc3
+    mode: use_local
+    tap_name: tap-ieee-plc3
+  - endpoint: scada
+    host_namespace: ns-ieee-scada
+    mode: use_local
+    tap_name: tap-ieee-scada
+  - endpoint: mitm
+    host_namespace: ns-ieee-mitm
+    mode: use_local
+    tap_name: tap-ieee-mitm
+  topology_name: ieee33_bw
+attacks:
+  enabled: true
+  scenarios:
+  - attacker:
+      endpoint: mitm
+      ip: 192.168.103.100
+      namespace: ns-ieee-mitm
+    enabled: true
+    intercept:
+      listen_port_base: 15030
+      port: 502
+      protocol: modbus_tcp
+      redirect: iptables_output_dnat
+      source: scada
+      targets:
+      - PLC3
+    name: ieee33_voltage_bias
+    rules:
+    - direction: request
+      function_codes:
+      - 16
+      name: bias_voltage_downlink
+      operation: add
+      target: PLC3
+      value: -0.1
+      variable: PLC1_V_BUS02
+      window:
+        start_after_sec: 0.0
+    trigger:
+      end_iteration: 40
+      start_iteration: 20
+      type: iteration_window
+    type: modbus_mitm
+reporting:
+  key_variables:
+  - PLC1.PLC1_V_BUS02
+  - PLC3.PLC3_P_LOAD24
+  - PLC3.PLC1_V_BUS02
+schema_version: 2
