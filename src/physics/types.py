@@ -61,28 +61,45 @@ class StepResult:
     quality: dict[str, str] = field(default_factory=dict)
     timestamps: dict[str, float] = field(default_factory=dict)
 
-    def validate(self, signals: Mapping[str, SignalSpec]) -> None:
-        if isinstance(self.time_s, bool) or not math.isfinite(self.time_s) or self.time_s < 0:
+    validity: dict[str, bool] = field(default_factory=dict)
+    freshness: dict[str, str] = field(default_factory=dict)
+
+    def validate(self, signals: Mapping[str, SignalSpec], *, measurement_max_age_s=0.) -> None:
+        if type(self.time_s) not in (int,float) or not math.isfinite(self.time_s) or self.time_s < 0:
             raise ValueError("Invalid physical result time")
+        if not isinstance(self.diagnostics,dict):
+            raise ValueError("StepResult diagnostics must be a mapping")
         if self.status not in {"ok", "initial"}:
             raise RuntimeError(f"Physical backend status {self.status}: {self.diagnostics}")
+        if any(not isinstance(v,dict) for v in (self.outputs,self.applied_inputs,self.quality,self.timestamps,self.validity,self.freshness)):
+            raise ValueError("StepResult signal metadata must be mappings")
         for direction, values in (("output", self.outputs), ("input", self.applied_inputs)):
             expected = {name for name, spec in signals.items() if spec.direction == direction}
             if set(values) != expected:
                 raise ValueError(f"Incomplete/unexpected {direction} ports: expected {expected}, got {set(values)}")
             for name, value in values.items():
                 signals[name].validate(value)
-        if set(self.quality) - self.outputs.keys() or set(self.timestamps) - self.outputs.keys():
+        if any(set(values)-self.outputs.keys() for values in (self.quality,self.timestamps,self.validity,self.freshness)):
             raise ValueError("Quality/timestamps reference unknown output ports")
+        if type(measurement_max_age_s) not in (int,float) or not math.isfinite(measurement_max_age_s) or measurement_max_age_s < 0:
+            raise ValueError('Invalid bounded measurement age capability')
+        qualities, stamps, validity, freshness = {}, {}, {}, {}
         for name in self.outputs:
             quality = self.quality.get(name, "good" if self.status == "ok" else "initial")
-            if quality not in ({"good", "unsupplied"} if self.status == "ok" else {"initial"}):
+            if not isinstance(quality,str) or quality not in ({"good", "unsupplied"} if self.status == "ok" else {"initial"}):
                 raise RuntimeError(f"Invalid physical measurement {name}: {quality}")
             stamp = self.timestamps.get(name, self.time_s)
-            if isinstance(stamp, bool) or not math.isfinite(stamp) or stamp != self.time_s:
+            if type(stamp) not in (int,float) or not math.isfinite(stamp) or not 0 <= self.time_s-stamp <= measurement_max_age_s:
                 raise ValueError(f"Stale/nonfinite measurement timestamp: {name}")
-            self.quality[name] = quality
-            self.timestamps[name] = stamp
+            usable = self.validity.get(name, quality != 'initial')
+            if type(usable) is not bool or (quality == 'good' and not usable) or (quality == 'initial' and usable):
+                raise ValueError(f'Contradictory validity for {name}: {quality}/{usable}')
+            age = 'initial' if quality == 'initial' else ('fresh' if stamp == self.time_s else 'delayed')
+            if name in self.freshness and self.freshness[name] != age:
+                raise ValueError(f'Contradictory freshness for {name}')
+            qualities[name], stamps[name], validity[name], freshness[name] = quality, stamp, usable, age
+        self.quality, self.timestamps = qualities, stamps
+        self.validity, self.freshness = validity, freshness
 
 
 @dataclass
@@ -96,9 +113,24 @@ class BackendConfig:
     # Consumed only by the historical compatibility policy, never by plugins.
     compatibility: dict[str, Any] = field(default_factory=dict)
 
+    registry: Any = None
+
+    @property
+    def timestep_seconds(self) -> float:
+        return self.step_seconds
+
     def model_path(self) -> Path:
         value = self.model.get("path")
         if not isinstance(value, str) or not value:
             raise ValueError("physics.model.path is required")
         path = Path(value).expanduser()
         return path.resolve() if path.is_absolute() else (self.config_path.parent / path).resolve()
+
+
+# Only PhysicsSession owns these fields. Diagnostics are never merged into them.
+PROTECTED_SNAPSHOT_FIELDS = frozenset({
+    'iteration', 'values', 'actuators_applied', 'status', 'quality', 'validity',
+    'measurement_times', 'sim_time', 'sim_time_start', 'sim_time_end',
+    'upsi_version', 'time_coordination', 'signal_metadata', 'backend',
+    'advanced', 'diagnostics', 'freshness',
+})

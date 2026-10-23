@@ -16,6 +16,7 @@ Performance note:
 from __future__ import annotations
 
 import csv
+import fcntl
 import json
 import math
 from pathlib import Path
@@ -52,8 +53,11 @@ def append_jsonl(path: Path, row: dict[str, Any]) -> None:
     """Append one structured runtime record as JSON Lines."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=_json_default))
-        f.write("\n")
+        fcntl.flock(f.fileno(),fcntl.LOCK_EX)
+        try:
+            f.write(json.dumps(row,ensure_ascii=False,sort_keys=True,default=_json_default)+'\n')
+            f.flush()
+        finally:fcntl.flock(f.fileno(),fcntl.LOCK_UN)
 
 
 def _to_cell(value: Any) -> str | int | float | bool | None:
@@ -115,7 +119,7 @@ def _read_all_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
     return header, rows
 
 
-def append_row(path: Path, row: dict[str, Any], *, fixed_columns: list[str] | None = None) -> None:
+def _append_row_unlocked(path: Path, row: dict[str, Any], *, fixed_columns: list[str] | None = None) -> None:
     """Append one row to a CSV file, expanding the header only when necessary.
 
     Normal case after the first cycle is O(1): read header line, append row.
@@ -163,3 +167,12 @@ def append_row(path: Path, row: dict[str, Any], *, fixed_columns: list[str] | No
         for old in existing_rows:
             writer.writerow({col: old.get(col, "") for col in header})
         writer.writerow({col: clean_row.get(col, "") for col in header})
+
+
+def append_row(path: Path, row: dict[str, Any], *, fixed_columns: list[str] | None = None) -> None:
+    """Serialize header expansion and append across all PLC writer processes."""
+    path.parent.mkdir(parents=True,exist_ok=True)
+    with path.with_name(path.name+'.lock').open('a') as lock:
+        fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+        try:_append_row_unlocked(path,row,fixed_columns=fixed_columns)
+        finally:fcntl.flock(lock.fileno(),fcntl.LOCK_UN)

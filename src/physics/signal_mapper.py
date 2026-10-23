@@ -11,7 +11,7 @@ from src.physics.types import SignalSpec
 class SignalMapper:
     def __init__(self, mapping, ports):
         self.ports = ports
-        self.specs, self.bindings = {}, {}
+        self.specs, self.bindings, self.transforms = {}, {}, {}
         targets = set()
         for group, direction in (('observations','output'), ('commands','input')):
             for name, item in mapping.get(group, {}).items():
@@ -33,6 +33,9 @@ class SignalMapper:
                     raise ValueError(f'{name}: affine transforms require float signals')
                 if spec.unit != native.unit and not ('scale' in item or 'offset' in item):
                     raise ValueError(f'{name}: unit change {native.unit} → {spec.unit} requires explicit scale/offset')
+                from src.physics.units import validate_transform
+                self.transforms[name] = validate_transform(native.unit,spec.unit,scale,offset,
+                    context=item.get('unit_context'),calibration=item.get('calibration_reason'))
                 self.specs[name] = spec
                 invert = item.get('invert',False)
                 if type(invert) is not bool or (invert and spec.dtype != 'bool'):

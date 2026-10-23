@@ -358,12 +358,18 @@ def export_all(config: Path, runtime_dir: Path | None = None, reports_dir: Path 
     samples = [row for snapshot in _load_physics_snapshots(runtime_dir) for row in signal_rows(snapshot)]
     outputs['physics_signals'] = reports_csv_dir/'physics_signals.csv'
     _write_csv(outputs['physics_signals'], samples, ['iteration','sim_time','backend','signal','direction',
-               'value','dtype','unit','valid','quality','measurement_time_s','input_effective_time_s'])
+               'value','dtype','unit','valid','quality','freshness','measurement_time_s','input_effective_time_s'])
     schema_path = runtime_dir/'json/signal_schema.json'
     if schema_path.exists():
         import shutil
         outputs['signal_schema'] = reports_dir/'signal_schema.json'
         shutil.copyfile(schema_path, outputs['signal_schema'])
+    outputs['signal_quality'] = reports_csv_dir/'signal_quality.csv'
+    decisions=_read_jsonl(runtime_dir/'raw/signal_quality.jsonl')
+    _write_csv(outputs['signal_quality'],decisions,['iteration','stage','destination','signal','source','quality',
+               'source_quality','validity','freshness','network_freshness','source_time_s','decision','reason',
+               'raw_value','selected_value','delivered_value','delivered_source_time_s',
+               'delivered_quality','delivered_freshness','write_status','write_error'])
     outputs["actuator_state"] = export_actuator_state(runtime_dir, reports_csv_dir)
     for path in export_scada_observed(runtime_dir, reports_csv_dir,
                                      key_variables=rt.raw.get("reporting", {}).get("key_variables",

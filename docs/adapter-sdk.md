@@ -58,7 +58,7 @@ from src.physics.types import BackendConfig
 
 scene = Path("examples/thermal_box/config.yaml").resolve()
 raw = yaml.safe_load(scene.read_text())
-configure_plugins(raw)
+registry = configure_plugins(raw)
 config = BackendConfig(
     config_path=scene,
     work_dir=Path("output/sdk-example"),
@@ -66,6 +66,7 @@ config = BackendConfig(
     options=raw["physics"],
     step_seconds=1.0,
     initial_inputs={"heater.enabled": False},
+    registry=registry,
 )
 backend = create_backend("thermal_box", config)
 try:
@@ -91,3 +92,37 @@ PYTHON_BIN="$(command -v python)" bash scripts/run_all.sh \
 The same runner generates and compiles two PLC programs, creates namespaces and ns-3 networking, starts OpenPLC/SCADA and advances the configured adapter. PLC1 exposes temperature and power; PLC2 turns heating on below 20 °C and off above 22 °C. Physical commands are BOOL values; protocol conversion stays in the existing PLC/Modbus layer.
 
 Before integrating another backend, exercise initialization/close, a known physical trajectory, unit/type/range failures, a failed solver and a stale or invalid result. Verify it in a fresh process with only its own dependencies available. The test suite also checks installed entry-point metadata and real EPANET/pandapower compatibility.
+
+
+## Context and fault contracts
+
+Capture `registry = configure_plugins(raw)` and pass it through `BackendConfig.registry` or `create_backend(..., registry=registry)`. Scene registrations never modify the global programmatic registry. A plugin name can be reused by another scene with a different source. Reserved built-in names and aliases cannot be replaced. `register_backend(..., registry=context)` supports explicit programmatic registration in one context; its global form remains for existing SDK applications.
+
+A plugin is trusted executable Python. Module/class and entry-point source strings are validated for shape and loaded only when selected. Import errors identify the failing source. Context isolation is not a sandbox or a guarantee that a native solver is thread-safe.
+
+Return `StepResult.validity` and `freshness` explicitly when necessary. Existing adapters may omit them: valid solved measurements default to true/fresh, configured initialization to false/initial. `unsupplied` describes physical state and does not by itself prescribe usability. The default strict measurement timestamp contract remains active; bounded asynchronous measurements require both the backend capability and an explicit scene age limit.
+
+Keep diagnostic details under `diagnostics`. They cannot override standardized snapshot fields. Close safely after partial initialization and failures. If advancement and cleanup both fail, the session records both and preserves the advancement exception. No failed result is published with a ready marker.
+
+Unit transformations must match the catalog and dimensions. Unknown/domain units and `pu` permit identity only. Same-unit calibration uses an explicit `calibration_reason`; water-column pressure conversion needs density and gravity. See [UPSI](upsi.md) for the full quality and unit contract.
+
+## Rootless contract fixture and standalone checks
+
+Third-party SDK tests can use the reusable fixture without PLC programs, root, namespaces or old runtime output:
+
+```python
+from src.physics.contract import exercise_backend
+samples = exercise_backend(backend, config.initial_inputs, config.timestep_seconds, steps=3)
+```
+
+The fixture validates descriptions/results, repeated initialization, input application and actual time grants, and always attempts cleanup. An original failure is retained if cleanup also fails.
+
+Run individual real physical backends without starting OpenPLC or ns-3:
+
+```bash
+python -m src.physics.contract --config examples/thermal_box/config.yaml
+python -m src.physics.contract --config examples/c_town/config.yaml
+python -m src.physics.contract --config examples/power_feeder/config_v2.yaml
+```
+
+Missing declared optional solver dependencies produce an explicit `skipped` status. Other loading/model failures produce `failed`. These are standalone solver checks, not complete network experiments. Full-loop and policy validation commands are listed in [the hardening report](upsi-hardening-validation.md).

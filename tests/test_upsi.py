@@ -155,6 +155,30 @@ backend.close()
             result=subprocess.run([sys.executable,'-c',code,str(THERMAL),tmp],cwd=ROOT,capture_output=True,text=True)
             self.assertEqual(result.returncode,0,result.stderr)
 
+    def test_diagnostics_cannot_overwrite_canonical_snapshots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session=PhysicsSession(prepare_v2(tmp))
+            diagnostics={'values':{'TEMPERATURE':9999},'sim_time':1234,'status':'error',
+                         'iteration':77,'quality':{'TEMPERATURE':'invalid'},
+                         'legacy_snapshot':{'values':{'TEMPERATURE':9999},'sim_time':5678,'backend':'spoof'}}
+            result=StepResult(1.,{'box.temperature':23.,'box.heater_power':0.},
+                              {'heater.enabled':False},diagnostics=diagnostics)
+            try:
+                with patch.object(session.backend,'advance',return_value=result):
+                    snapshot=session.advance({'HEATER':False},1)
+                self.assertEqual(snapshot['values']['TEMPERATURE'],23.)
+                self.assertEqual(snapshot['sim_time'],1.)
+                self.assertEqual(snapshot['iteration'],1)
+                self.assertEqual(snapshot['status'],'ok')
+                self.assertEqual(snapshot['backend'],'thermal_box')
+                self.assertEqual(snapshot['diagnostics'],diagnostics)
+                snapshot['values']['TEMPERATURE']=0
+                snapshot['diagnostics']['values']['TEMPERATURE']=0
+                result.diagnostics['sim_time']=0
+                self.assertEqual(session.initialize()['values']['TEMPERATURE'],23.)
+                self.assertEqual(session.initialize()['diagnostics']['sim_time'],1234)
+            finally:session.close()
+
     def test_real_thermal_ode_and_explicit_measurement_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             rt=prepare_v2(tmp);session=PhysicsSession(rt)

@@ -42,6 +42,8 @@ def main() -> int:
 
     config_path = args.config.expanduser().resolve()
     cfg = load_yaml(config_path)
+    from src.physics.quality import validate_policy
+    validate_policy(cfg)
     backend = physics_backend(cfg)
     physics_timestep(cfg)
     init_style = physics_init_style(cfg, backend)

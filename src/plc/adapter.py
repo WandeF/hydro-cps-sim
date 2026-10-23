@@ -17,7 +17,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from src.io.csv import append_row, csv_dir, json_dir
+from src.io.csv import append_row, csv_dir, json_dir, raw_dir
+from src.physics.quality import QualityGate, QualityError, source_metadata
 from src.comm.modbus import ModbusEndpoint
 from src.core.config import RuntimeConfig, PlcRuntime, load_runtime_config, read_json, write_json
 from src.sync.filesystem import DEFAULT_POLL_INTERVAL, marker_path, stop_requested, touch_marker, wait_for_marker
@@ -50,10 +51,13 @@ def _state_values(state_path: Path) -> dict[str, Any]:
     return values
 
 
-def _write_sensors_with_client(plc: PlcRuntime, mb: ModbusEndpoint, values: dict[str, Any], scope: str) -> dict[str, Any]:
+def _write_sensors_with_client(plc: PlcRuntime, mb: ModbusEndpoint, values: dict[str, Any], scope: str, *, snapshot=None, gate=None, iteration=None) -> dict[str, Any]:
     written: dict[str, float] = {}
     skipped: dict[str, str] = {}
     writes_by_md: dict[int, float] = {}
+    gate = gate or QualityGate()
+    snapshot = snapshot or {}
+    records = []
 
     for var in plc.md_vars.values():
         if var.name == "PLC_Ready":
@@ -67,19 +71,32 @@ def _write_sensors_with_client(plc: PlcRuntime, mb: ModbusEndpoint, values: dict
             if key in values:
                 raw = values[key]
                 break
-        if raw is None:
-            skipped[var.name] = f"no value for {var.name}/{var.tag}"
+        name = var.name if var.name in values else var.tag
+        value,record = gate.decide(name,raw,source_metadata(snapshot,name),
+            destination=plc.name,iteration=iteration,stage='plc_local',source='physics')
+        record["variable"] = var.name
+        records.append(record)
+        if value is None:
+            skipped[var.name] = record['reason']
             continue
 
-        value = float(raw)
         writes_by_md[var.md_index] = value
         written[var.name] = value
 
     # Batch contiguous %MD writes to reduce Modbus round trips.
-    if writes_by_md:
-        mb.write_real_mds(writes_by_md)
-
-    return {"plc": plc.name, "written": written, "skipped": skipped}
+    try:
+        if writes_by_md: mb.write_real_mds(writes_by_md)
+    except Exception as exc:
+        gate.finish(records,error=exc)
+        raise
+    gate.finish(records,written=[r['signal'] for r in records if r['selected_value'] is not None])
+    metadata = {}
+    for r in records:
+        if r['write_status'] != 'written': continue
+        meta = dict(r.get('held_metadata',r['source_metadata']))
+        if 'held_metadata' in r: meta['freshness']='stale'
+        metadata[r['variable']] = meta
+    return {'plc':plc.name,'written':written,'skipped':skipped,'quality_audit':records,'measurement_metadata':metadata}
 
 
 def _read_actuators_with_client(plc: PlcRuntime, mb: ModbusEndpoint) -> dict[str, Any]:
@@ -213,10 +230,12 @@ def _write_plc_adapter_timing_csv(runtime_dir: Path, timing: dict[str, Any]) -> 
 def write_sensors(args: argparse.Namespace) -> int:
     rt = load_runtime_config(args.config)
     plc = _resolve_plc(rt, args.plc)
-    values = _state_values(args.state)
+    snapshot = read_json(args.state)
+    values = snapshot.get('values',snapshot)
+    gate = QualityGate(rt.raw,rt.output_dir/'runtime/raw/signal_quality.jsonl')
 
     with ModbusEndpoint(LOCAL_HOST, port=args.port, unit_id=args.unit_id, timeout=args.timeout) as mb:
-        payload = _write_sensors_with_client(plc, mb, values, args.scope)
+        payload = _write_sensors_with_client(plc, mb, values, args.scope, snapshot=snapshot,gate=gate,iteration=snapshot.get('iteration'))
 
     if args.out:
         write_json(args.out, payload)
@@ -297,6 +316,7 @@ def daemon(args: argparse.Namespace) -> int:
 
     mb: ModbusEndpoint | None = None
     iteration = args.start_iteration
+    gate = QualityGate(rt.raw,raw_dir(runtime_dir)/'signal_quality.jsonl')
     while not _STOP and not stop_requested(sync_dir):
         if end_iteration is not None and iteration >= end_iteration:
             break
@@ -317,19 +337,22 @@ def daemon(args: argparse.Namespace) -> int:
 
             load_t0 = time.monotonic()
             state_path = out_json_dir / f"physics_{iteration:04d}.json"
-            values = _state_values(state_path)
+            snapshot = read_json(state_path)
+            values = snapshot.get('values',snapshot)
             timing["load_state_sec"] = time.monotonic() - load_t0
 
             write_sensor_t0 = time.monotonic()
             if mb is None:
                 mb = _connect_local(args)
             try:
-                local_payload = _write_sensors_with_client(plc, mb, values, args.scope)
+                local_payload = _write_sensors_with_client(plc, mb, values, args.scope,snapshot=snapshot,gate=gate,iteration=iteration)
+            except QualityError:
+                raise
             except Exception:
                 if mb is not None:
                     mb.close()
                 mb = _connect_local(args)
-                local_payload = _write_sensors_with_client(plc, mb, values, args.scope)
+                local_payload = _write_sensors_with_client(plc, mb, values, args.scope,snapshot=snapshot,gate=gate,iteration=iteration)
             timing["write_sensors_sec"] = time.monotonic() - write_sensor_t0
 
             local_output_t0 = time.monotonic()

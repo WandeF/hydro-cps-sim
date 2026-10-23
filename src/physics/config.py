@@ -21,8 +21,8 @@ def physics_backend(raw: dict[str, Any], override: str | None = None) -> str:
         raise ValueError("schema_version 2 requires physics.backend")
     name = ALIASES.get(str(requested), str(requested))
     from src.physics.registry import configure_plugins, registration
-    configure_plugins(raw)
-    registration(name)
+    registry = configure_plugins(raw)
+    registration(name, registry)
     return name
 
 
@@ -45,7 +45,9 @@ def physics_timestep(raw: dict[str, Any]) -> float | None:
     if not math.isfinite(step) or step <= 0:
         raise ValueError("physics.timestep must be finite and positive")
     from src.physics.registry import registration
-    quantum = registration(physics_backend(raw)).time_quantum_s
+    name = physics_backend(raw)
+    from src.physics.registry import configure_plugins
+    quantum = registration(name, configure_plugins(raw)).time_quantum_s
     if quantum is not None and not (step/quantum).is_integer():
         raise ValueError(f"Selected backend requires physics.timestep in multiples of {quantum} seconds")
     return step
@@ -54,10 +56,12 @@ def physics_timestep(raw: dict[str, Any]) -> float | None:
 def physics_init_style(raw: dict[str, Any], backend: str | None = None) -> str:
     backend = backend or physics_backend(raw)
     from src.physics.registry import registration
-    default = "current" if raw.get("schema_version") == 2 else registration(backend).initialization
+    from src.physics.registry import configure_plugins
+    spec = registration(backend, configure_plugins(raw))
+    default = "current" if raw.get("schema_version") == 2 else spec.initialization
     style = str(physics_options(raw).get("init_style", default))
     if style not in ("dhalsim", "current"):
         raise ValueError("physics.init_style must be dhalsim or current")
-    if style == "dhalsim" and registration(backend).initialization != "dhalsim":
+    if style == "dhalsim" and spec.initialization != "dhalsim":
         raise ValueError(f"{backend} requires current initialization, not DHALSIM dummy water states")
     return style

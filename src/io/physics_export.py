@@ -41,6 +41,7 @@ def signal_rows(snapshot):
             yield {'iteration':snapshot.get('iteration'), 'sim_time':snapshot.get('sim_time'),
                    'backend':snapshot.get('backend'), 'signal':name, 'direction':direction, 'value':value,
                    'dtype':spec.get('dtype',''), 'unit':spec.get('unit',''),
+                   'freshness':snapshot.get('freshness',{}).get(name,''),
                    'valid':snapshot.get('validity',{}).get(name, snapshot.get('status') == 'ok'),
                    'quality':snapshot.get('quality',{}).get(name, 'good' if snapshot.get('status') == 'ok' else snapshot.get('status','unknown')),
                    'measurement_time_s':snapshot.get('measurement_times',{}).get(name, snapshot.get('sim_time')),

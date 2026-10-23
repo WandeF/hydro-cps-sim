@@ -131,3 +131,25 @@ def resolve_water_model(raw, config_path):
     for candidate in (config_path.parent/path, config_path.parent/path.name):
         if candidate.is_file(): return candidate.resolve()
     return path
+
+
+def snapshot_compatibility_fields(options, diagnostics):
+    """Explicit historical presentation fields; never a general diagnostics merge."""
+    import copy
+    fields = {}
+    if options['backend'] == 'dhalsim_epynet' and options.get('legacy'):
+        legacy = diagnostics.get('legacy_snapshot', {})
+        if not isinstance(legacy,dict): legacy={}
+        allowed = {'warning','hydraulic_timestep','link_status','link_flow',
+                   'internal_hydraulic_steps','step_order','inp_controls',
+                   'last_tstep','initialization_stage'}
+        fields.update({k:copy.deepcopy(v) for k,v in legacy.items() if k in allowed})
+        historic_backends = {'dhalsim_compatible_initial','dhalsim_epynet',
+                             'dhalsim_epynet_initial','dhalsim_epynet_snapshot'}
+        if isinstance(legacy.get('backend'),str) and legacy.get('backend') in historic_backends: fields['backend'] = legacy['backend']
+        if type(diagnostics.get('internal_steps')) is int: fields['internal_steps'] = diagnostics['internal_steps']
+    if options['backend'] == 'pandapower':
+        for name, expected in (('solver_converged', bool), ('unsupplied_buses', list)):
+            if name in diagnostics and type(diagnostics[name]) is expected:
+                fields[name] = copy.deepcopy(diagnostics[name])
+    return fields

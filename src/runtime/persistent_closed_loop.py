@@ -846,13 +846,19 @@ def main() -> int:
 
 
     finally:
+        primary_error = sys.exc_info()[1]
+        if primary_error is not None:
+            physics.abort(primary_error,stage='control_loop',iteration=locals().get('i',physics.start_cycle))
+        close_error = None
         try:
             physics.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            close_error = exc
         if bool(_enabled_attack_scenarios(rt.raw)):
             _stop_configured_attacks(args, project_root, runtime_dir)
         stop_daemons(processes, log_handles, sync_dir)
+        if close_error is not None and primary_error is None:
+            raise close_error
 
     print("\n[DONE] Persistent closed-loop run finished.")
     print(f"[PHYSICS-CSV] {csv_dir(runtime_dir) / 'physics.csv'}")

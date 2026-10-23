@@ -56,7 +56,7 @@ def normalize_physics(raw, config_path):
                     item[key] = metadata[key]
             if version == 2 and 'dtype' not in item:
                 raise ValueError(f'{name} requires an explicit dtype in signals or mapping')
-            if set(item) - {'port','dtype','unit','minimum','maximum','scale','offset','invert','missing'}:
+            if set(item) - {'port','dtype','unit','minimum','maximum','scale','offset','invert','missing','unit_context','calibration_reason'}:
                 raise ValueError(f'{name} has unknown signal mapping options')
             if 'dtype' in item:
                 from src.physics.types import SignalSpec

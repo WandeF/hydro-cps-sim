@@ -19,10 +19,10 @@ def create_physics_adapter(cfg: RuntimeConfig, mode: str | None = None,
     return resolve_factory(source)(cfg, work_dir)
 
 
-def check_physics_dependencies(backend: str) -> None:
+def check_physics_dependencies(backend: str, registry=None) -> None:
     """Import only the selected solver, before the runner changes the system."""
     from src.physics.registry import registration, resolve_factory
-    spec = registration(backend)
+    spec = registration(backend, registry)
     dependency = spec.dependency
     try:
         if dependency:
@@ -39,9 +39,10 @@ def backend_configuration(cfg, work_dir=None):
     from src.physics.types import BackendConfig
     options = normalize_physics(cfg.raw, cfg.config_path)
     options['init_style'] = physics_init_style(cfg.raw)
+    from src.physics.registry import configure_plugins
     return BackendConfig(cfg.config_path, work_dir or cfg.output_dir/'runtime', options['model'], options,
                          cfg.timestep_seconds, {},
-                         {'raw':cfg.raw, 'initial_state':dict(cfg.initial_state)})
+                         {'raw':cfg.raw, 'initial_state':dict(cfg.initial_state)}, registry=configure_plugins(cfg.raw))
 
 
 def create_backend(cfg, work_dir=None):

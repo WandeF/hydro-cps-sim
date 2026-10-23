@@ -73,6 +73,7 @@ class RuntimeConfig:
             "hydraulic_timestep": self.hydraulic_timestep,
             "physics_backend": physics_backend(self.raw),
             "timestep": self.hydraulic_timestep,
+            "timestep_seconds": self.timestep_seconds,
             "plcs": {
                 name: {
                     "namespace": plc.namespace,
@@ -229,6 +230,8 @@ def _hydraulic_timestep(cfg: dict[str, Any]) -> float:
 def load_runtime_config(config_path: Path | str) -> RuntimeConfig:
     config_path = Path(config_path).resolve()
     cfg = load_yaml(config_path)
+    from src.physics.quality import validate_policy
+    validate_policy(cfg)
     from src.physics.config import physics_backend, physics_init_style, physics_timestep
     backend = physics_backend(cfg)
     from src.physics.registry import registration
@@ -285,5 +288,14 @@ def read_json(path: Path | str) -> Any:
 def write_json(path: Path | str, data: Any) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+    import os
+    import tempfile
+    mode = (p.stat().st_mode & 0o777) if p.exists() else 0o644
+    fd, temporary = tempfile.mkstemp(prefix=f'.{p.name}.',suffix='.tmp',dir=p.parent)
+    try:
+        with os.fdopen(fd,'w',encoding='utf-8') as f:
+            os.fchmod(f.fileno(),mode)
+            json.dump(data,f,ensure_ascii=False,indent=2,sort_keys=True)
+        os.replace(temporary,p)
+    finally:
+        if os.path.exists(temporary): os.unlink(temporary)

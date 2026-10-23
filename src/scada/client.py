@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
+from src.physics.quality import QualityGate, QualityError, source_metadata
 from src.io.csv import append_jsonl, append_row, csv_dir, json_dir, raw_dir
 from src.comm.modbus import ModbusEndpoint
 from src.core.config import MdVar, RuntimeConfig, load_runtime_config, read_json, write_json
@@ -43,6 +44,30 @@ def _install_signal_handlers() -> None:
 
     signal.signal(signal.SIGTERM, _handler)
     signal.signal(signal.SIGINT, _handler)
+
+
+def annotate_poll(rt, payload, physics, local_writes, previous_poll):
+    """Carry the metadata of the value actually in each PLC, including holds."""
+    import copy
+    for name,item in payload.get('plcs',{}).items():
+        item['measurement_metadata']={}
+        plc=rt.plcs.get(name)
+        if plc is None: continue
+        for variable in item.get('md',{}):
+            var=plc.md_vars.get(variable)
+            if var is None or variable=='PLC_Ready': continue
+            if item.get('used_previous'):
+                meta=copy.deepcopy(previous_poll.get(name,{}).get('measurement_metadata',{}).get(variable,{}))
+                if not meta: meta={'quality':'missing','valid':False,'source_time_s':None}
+                meta['network_freshness']='stale'
+                meta['cache_iteration']=item.get('previous_iteration')
+            else:
+                local=local_writes.get(name,{})
+                meta=copy.deepcopy(local.get('measurement_metadata',{}).get(variable))
+                if meta is None:
+                    meta={'quality':'missing','valid':False,'freshness':'stale','source_time_s':None}
+                meta['network_freshness']='fresh'
+            item['measurement_metadata'][variable]=meta
 
 
 def _source_candidates(var: MdVar, poll: dict[str, Any], physics_values: dict[str, Any]) -> list[tuple[str, Any]]:
@@ -289,9 +314,13 @@ def _prepare_downlink_writes(
     plc: Any,
     poll_payload: dict[str, Any],
     physics_values: dict[str, Any],
+    *, physics=None, gate=None, iteration=None,
 ) -> tuple[dict[str, Any], list[tuple[MdVar, float, str]]]:
     item: dict[str, Any] = {"ip": plc.ip, "written": {}, "skipped": {}, "errors": [], "status": "ok", "timeout": False}
     writes: list[tuple[MdVar, float, str]] = []
+    gate = gate or QualityGate()
+    physics = physics or {}
+    item["quality_audit"] = []
 
     for var in plc.md_vars.values():
         if var.name == "PLC_Ready":
@@ -301,14 +330,24 @@ def _prepare_downlink_writes(
             continue
 
         candidates = _source_candidates(var, poll_payload, physics_values)
-        if not candidates:
-            item["skipped"][var.name] = f"no source for {var.name}/{var.tag}"
-            continue
-        source, raw = candidates[0]
+        source,raw = candidates[0] if candidates else ('missing',None)
+        meta=source_metadata(physics,var.tag)
+        if source.startswith('poll:'):
+            owner=poll_payload.get('plcs',{}).get(var.source_prefix,{})
+            meta=dict(owner.get('measurement_metadata',{}).get(var.name,meta))
+            if owner.get('used_previous') or owner.get('timeout') or owner.get('warmup_timeout'):
+                meta['network_freshness']='stale'
+                meta['cache_iteration']=owner.get('previous_iteration')
         try:
-            writes.append((var, float(raw), source))
-        except Exception as exc:
-            item["skipped"][var.name] = f"bad value from {source}: {raw!r}: {exc}"
+            value,record=gate.decide(var.tag,raw,meta,destination=plc.name,
+                iteration=iteration,stage='scada_downlink',source=source)
+        except QualityError:
+            gate.finish(item['quality_audit'],error='cancelled by fail_fast')
+            raise
+        record['variable']=var.name
+        item['quality_audit'].append(record)
+        if value is None: item['skipped'][var.name]=record['reason']
+        else: writes.append((var,value,source))
 
     return item, writes
 
@@ -403,14 +442,20 @@ def _downlink_runtime(
     poll_payload: dict[str, Any],
     physics_values: dict[str, Any],
     endpoints: dict[str, ModbusEndpoint] | None = None,
+    *, physics=None, gate=None, iteration=None,
 ) -> dict[str, Any]:
+    gate = gate or getattr(args,"_quality_gate",None) or QualityGate(rt.raw)
     payload: dict[str, Any] = {"plcs": {}, "flat": {}}
     tasks: list[tuple[Any, dict[str, Any], list[tuple[MdVar, float, str]]]] = []
 
     for plc in rt.plcs.values():
         if not plc.ip:
             continue
-        item, writes = _prepare_downlink_writes(plc, poll_payload, physics_values)
+        try:
+            item, writes = _prepare_downlink_writes(plc,poll_payload,physics_values,physics=physics,gate=gate,iteration=iteration)
+        except QualityError:
+            for _,pending,_ in tasks: gate.finish(pending['quality_audit'],error='cancelled by fail_fast')
+            raise
         tasks.append((plc, item, writes))
 
     if len(tasks) <= 1 or _modbus_workers(args, len(tasks)) <= 1:
@@ -420,6 +465,8 @@ def _downlink_runtime(
             results = list(executor.map(lambda t: _downlink_one_plc(t[0], args, t[1], t[2], endpoints), tasks))
 
     for plc_name, item, flat in results:
+        delivered=[r['signal'] for r in item['quality_audit'] if r['variable'] in item['written']]
+        gate.finish(item['quality_audit'],written=delivered,error='; '.join(item['errors']) or None)
         payload["plcs"][plc_name] = item
         payload["flat"].update(flat)
         status = item.get("status", "ok")
@@ -562,6 +609,7 @@ def _write_scada_observed_csv(runtime_dir: Path, iteration: int, poll_payload: d
                 "direction": "response",
                 "timestamp_epoch": observed_at,
                 "kind": "md",
+                "measurement_metadata":item.get("measurement_metadata",{}).get(name,{}),
             }
             append_jsonl(raw_path, row)
             append_row(
@@ -700,7 +748,8 @@ def downlink(args: argparse.Namespace) -> int:
     if not isinstance(physics_values, dict):
         raise ValueError("physics JSON must contain object or {'values': object}")
 
-    payload = _downlink_runtime(rt, args, poll_payload, physics_values)
+    payload = _downlink_runtime(rt,args,poll_payload,physics_values,physics=physics,
+        gate=QualityGate(rt.raw,rt.output_dir/'runtime/raw/signal_quality.jsonl'),iteration=physics.get('iteration'))
     write_json(args.out, payload)
     return 0
 
@@ -748,6 +797,7 @@ def daemon(args: argparse.Namespace) -> int:
         print(f"[SCADA-DAEMON] persistent Modbus connections={len(endpoints)}", flush=True)
 
     previous_poll: dict[str, dict[str, Any]] = {}
+    args._quality_gate = QualityGate(rt.raw,raw_dir(runtime_dir)/'signal_quality.jsonl')
     iteration = args.start_iteration
     try:
         while not _STOP and not stop_requested(sync_dir):
@@ -771,6 +821,9 @@ def daemon(args: argparse.Namespace) -> int:
                 poll_path = out_json_dir / f"scada_poll_{iteration:04d}.json"
                 poll_t0 = time.monotonic()
                 poll_payload = _poll_runtime(rt, args, endpoints=endpoints, previous_poll=previous_poll)
+                physics=read_json(out_json_dir/f'physics_{iteration:04d}.json')
+                local_writes={plc.name:read_json(out_json_dir/f'local_write_{iteration:04d}_{plc.lower_name}.json') for plc in rt.plcs.values()}
+                annotate_poll(rt,poll_payload,physics,local_writes,previous_poll)
                 write_json(poll_path, poll_payload)
                 _write_scada_observed_csv(runtime_dir, iteration, poll_payload)
                 _write_scada_timeout_events(runtime_dir, iteration, "poll", poll_payload)
@@ -780,6 +833,7 @@ def daemon(args: argparse.Namespace) -> int:
                     if item.get("md") or item.get("coils"):
                         previous_poll[plc_name] = {
                             "iteration": iteration,
+                            "measurement_metadata": item.get("measurement_metadata",{}),
                             "md": dict(item.get("md", {}) or {}),
                             "coils": dict(item.get("coils", {}) or {}),
                         }
@@ -795,7 +849,7 @@ def daemon(args: argparse.Namespace) -> int:
 
                 downlink_path = out_json_dir / f"scada_downlink_{iteration:04d}.json"
                 downlink_t0 = time.monotonic()
-                downlink_payload = _downlink_runtime(rt, args, poll_payload, physics_values, endpoints=endpoints)
+                downlink_payload = _downlink_runtime(rt,args,poll_payload,physics_values,endpoints=endpoints,physics=physics,iteration=iteration)
                 write_json(downlink_path, downlink_payload)
                 _write_scada_timeout_events(runtime_dir, iteration, "downlink", downlink_payload)
                 timing["downlink_sec"] = time.monotonic() - downlink_t0
