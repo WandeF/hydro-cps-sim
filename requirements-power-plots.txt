@@ -1,3 +1,3 @@
 -r requirements-power.txt
-# Optional, only for scripts/plot_ieee33_results.py.
+# Optional plotting for IEEE33, power_feeder and thermal_box figures.
 matplotlib==3.10.7
