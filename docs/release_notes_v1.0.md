@@ -1,6 +1,6 @@
 # Hydro-CPS-Sim V1.0 版本说明
 
-Hydro-CPS-Sim V1.0 提供 C-Town 水网、PLC 控制、SCADA 通信和 ns-3 网络联合仿真，以及 MITM、UDP DoS 和 PLC 逻辑注入实验。
+水网信息物理系统跨层安全仿真软件（Hydro-CPS-Sim V1.0）提供 C-Town 水网、PLC 控制、SCADA 通信和 ns-3 网络联合仿真，以及 MITM、UDP DoS 和 PLC 逻辑注入实验。
 
 ## 使用体验
 

@@ -1,6 +1,6 @@
 # Hydro-CPS-Sim V1.0
 
-Hydro-CPS-Sim 是面向水网信息物理系统（Water CPS）的跨层安全联合仿真软件。通过 OpenPLC 执行控制程序、ns-3 承载通信网络、DHALSIM-epynet/EPANET 计算水力状态，由 Python 协调闭环运行并导出实验记录。
+水网信息物理系统跨层安全仿真软件（Hydro-CPS-Sim）是面向水网信息物理系统（Water CPS）的跨层安全联合仿真软件。通过 OpenPLC 执行控制程序、ns-3 承载通信网络、DHALSIM-epynet/EPANET 计算水力状态，由 Python 协调闭环运行并导出实验记录。
 
 ## 核心功能
 
@@ -71,7 +71,7 @@ bash scripts/run_all.sh local-configs/baseline.yaml --log-level concise
 
 V1.0 对应 `main` 分支的水网联合仿真功能。版本号保存在 `VERSION` 中，当前发布状态见[检查清单](docs/release_checklist.md)。
 
-OpenPLC、ns-3、DHALSIM-epynet 和 EPANET 的来源及许可说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。项目级许可证、中文登记名称和权属信息待确认。
+OpenPLC、ns-3、DHALSIM-epynet 和 EPANET 的来源及许可说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。项目级许可证与代码来源清单待权利人确认。
 
 ## 使用限制与验证
 
