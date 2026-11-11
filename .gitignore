@@ -49,3 +49,14 @@ CMakeCache.txt
 tmp/
 temp/
 *.tmp
+
+# Private application materials and local configuration copies
+/deliverables/soft_copyright/
+/local-configs/
+/hydro.zip
+.env
+.env.*
+!.env.example
+*.pcap
+*.pcapng
+/dist/

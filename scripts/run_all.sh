@@ -8,6 +8,8 @@ ITERATIONS=""
 LOGIC_WAIT="0.3"
 POLL_INTERVAL="0.005"
 SCADA_MODBUS_WORKERS="8"
+LOG_LEVEL=""
+ORIGINAL_ARGS=("$@")
 
 usage() {
   cat <<'EOF'
@@ -18,6 +20,7 @@ Usage: bash scripts/run_all.sh [config.yaml] [options]
   --logic-wait SECONDS     Wait after SCADA downlink before reading PLC outputs (default: 0.3)
   --poll-interval SECONDS  File-marker polling interval (default: 0.005)
   --scada-modbus-workers N Concurrent SCADA workers (default: 8)
+  --log-level LEVEL       concise (progress bars) or debug (full output); defaults to YAML log_level
   -h, --help               Show this help
 
 Set PYTHON_BIN to the Python executable containing the simulation dependencies.
@@ -39,6 +42,8 @@ while [[ $# -gt 0 ]]; do
       require_value "$@"; POLL_INTERVAL="$2"; shift 2 ;;
     --scada-modbus-workers)
       require_value "$@"; SCADA_MODBUS_WORKERS="$2"; shift 2 ;;
+    --log-level)
+      require_value "$@"; LOG_LEVEL="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     -*) fail "Unknown option: $1" ;;
     *)
@@ -55,6 +60,12 @@ CONFIG="$(realpath "$CONFIG")"
 config_values="$("$PYTHON_BIN" -m src.run.config_info --config "$CONFIG")"
 eval "$config_values"
 ITERATIONS="${ITERATIONS:-$ITERATIONS_FROM_CONFIG}"
+LOG_LEVEL="${LOG_LEVEL:-$LOG_LEVEL_FROM_CONFIG}"
+case "$LOG_LEVEL" in
+  concise|简洁) LOG_LEVEL=concise ;;
+  debug|info|warning|error) ;;
+  *) fail "Unsupported log level: $LOG_LEVEL (use concise or debug)" ;;
+esac
 "$PYTHON_BIN" - "$ITERATIONS" "$LOGIC_WAIT" "$POLL_INTERVAL" "$SCADA_MODBUS_WORKERS" "$OUTPUT_DIR" "$PROJECT_ROOT" "$CONFIG" <<'PY'
 import math
 import sys
@@ -82,6 +93,13 @@ PY
 [[ -x "$NS3_PATH/ns3" ]] || fail "ns-3 launcher not found: $NS3_PATH/ns3"
 [[ -f "$OPENPLC_PATH/webserver/scripts/compile_program.sh" ]] || fail "OpenPLC compiler not found"
 for cmd in sudo ip flock setsid; do command -v "$cmd" >/dev/null || fail "Required command not found: $cmd"; done
+if [[ "$LOG_LEVEL" == concise && "${HYDRO_PROGRESS_CHILD:-0}" != 1 ]]; then
+  # Keep authentication attached to the caller's terminal.
+  sudo -v || fail "sudo authentication failed"
+  exec "$PYTHON_BIN" -m src.run.progress --log-dir "$OUTPUT_DIR/logs" \
+    --label "$(basename "$CONFIG")" --iterations "$ITERATIONS" \
+    -- bash "$PROJECT_ROOT/scripts/run_all.sh" "${ORIGINAL_ARGS[@]}"
+fi
 # Both dependencies contain shared build products. Hold locks for the whole run.
 exec 8>"$NS3_PATH/.hydro-cps-run.lock"
 flock -n 8 || fail "Another Hydro-CPS run is using this ns-3 installation"
@@ -247,7 +265,7 @@ start_ns3() {
 
 run_closed_loop() {
   RUNTIME_STARTED=1
-  sudo -n "$PYTHON_BIN" -m src.runtime.persistent_closed_loop \
+  sudo -n "$PYTHON_BIN" -u -m src.runtime.persistent_closed_loop \
     --config "$CONFIG" --iterations "$ITERATIONS" --python "$PYTHON_BIN" \
     --physics-mode dhalsim_epynet --init-style dhalsim \
     --poll-interval "$POLL_INTERVAL" --logic-wait "$LOGIC_WAIT" \

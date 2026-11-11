@@ -1,140 +1,46 @@
-# C-Town MITM 攻击实验说明
+# C-Town MITM 实验说明
 
-`config_mitm.yaml` 是在原始 `config.yaml` 基线配置上的攻击实验配置。当前实现的逻辑是：
+MITM 场景通过 Modbus/TCP 代理转发 SCADA 与 PLC 的通信，并在配置的控制周期窗口内修改指定变量。
 
-```text
-攻击配置 -> 生成包含攻击节点的 network.sh/ns3_network.cc -> 启动常驻 MITM 代理和 DNAT -> 闭环运行时按轮次切换攻击状态
-```
+## 场景配置
 
-## 网络拓扑扩展
+| 配置文件 | 目标 PLC | 变量 | 修改位置 | 控制周期窗口 | 代理端口 |
+| --- | --- | --- | --- | --- | --- |
+| `config_mitm_plc4.yaml` | PLC4 | `PLC8_T7` | 功能码 16 的写入请求 | 20–40 | 15030 |
+| `config_mitm_plc9.yaml` | PLC8 | `PLC8_T7` | 功能码 3 的读取响应 | 20–40 | 15020 |
+| `config_mitm_composite_plc7_plc9.yaml` | PLC6 | `PLC6_T5` | 功能码 3 的读取响应 | 20–40 | 15040 |
+| 同上 | PLC8 | `PLC8_T7` | 功能码 3 的读取响应 | 30–50 | 15050 |
 
-`config_mitm.yaml` 在 `network.nodes.endpoints` 中增加攻击端点：
+上述规则均将匹配值设置为 `5.2`。文件名沿用历史命名，当前目标以 YAML 中的 `target` 和 `variable` 为准。PLC4 场景修改 SCADA 下发给 PLC4 的跨 PLC 依赖变量；PLC8 场景修改 SCADA 读取的水箱观测值。
 
-```text
-mitm / ns-attacker / tap-attacker / 192.168.255.100
-```
+## 网络与触发流程
 
-并把它接入 `scada_lan`。因此：
+配置中的攻击端点由网络生成器写入 `network.sh` 和 `ns3_network.cc`，通过 Linux namespace、TAP 和 ns-3 TapBridge 接入实验网络。
 
-- `network.sh` 会自动创建 `ns-attacker`、`tap-attacker`、bridge、veth 和默认路由；
-- `ns3_network.cc` 会自动创建 ns-3 中的 `mitm` 节点，并通过 TapBridge 接入 SCADA 局域网；
-- 后续复合攻击只需要继续在 `attacks.scenarios` 中追加攻击场景，或继续在 `network` 中增加新的攻击节点。
+MITM 代理和 DNAT 规则在 SCADA 进程启动前建立。以 `config_mitm_plc9.yaml` 为例，SCADA 发往 PLC8 的 502 端口的流量被重定向到攻击端点的 15020 端口，代理再连接真实 PLC8。
 
-## 轮次触发
+协调器按控制周期更新攻击状态。第 1–19 周期代理正常转发，第 20–40 周期修改匹配响应，第 41 周期起恢复正常转发；运行结束时清理代理和重定向规则。
 
-当前 MITM 攻击配置为第 20 轮到第 40 轮生效：
+`trigger` 控制场景的迭代窗口。`rules[].window` 控制代理启动后的实际时间窗口，示例使用 `start_after_sec: 0.0`。规则支持 `set`、`add`/`bias` 和 `multiply`/`scale` 操作。
 
-```yaml
-attacks:
-  enabled: true
-  scenarios:
-    - name: mitm_fake_T7
-      enabled: true
-      type: modbus_mitm
-      trigger:
-        type: iteration_window
-        start_iteration: 20
-        end_iteration: 40
-```
+## 运行实验
 
-这里的窗口是闭环控制轮次窗口。协调器会在释放 `physics_0020.ready` 之前启动攻击代理和 iptables 规则，在释放 `physics_0041.ready` 之前撤销攻击，因此攻击实际覆盖控制轮次 `20..40`。
-
-## 当前 MITM 行为
-
-攻击链路为：
-
-```text
-SCADA -> PLC9:502
-    在 ns-scada 中被 iptables OUTPUT DNAT 重定向为：
-SCADA -> mitm:15020
-    攻击代理再连接真实：
-mitm -> PLC9:502
-```
-
-攻击代理转发 Modbus/TCP 流量，并把 SCADA 从 PLC9 读取到的 `PLC9_T7` 响应值替换为 `5.2`。这样 SCADA 后续会把伪造后的高水位值下发到 PLC4 的跨 PLC 依赖变量，进而影响 PLC4 对 `PU10/PU11` 的控制判断。
-
-MITM 代理和 DNAT 规则在 SCADA daemon 启动前就建立。第 1..19 轮代理透明转发，第 20..40 轮状态文件切换为 active 并篡改匹配响应，第 41 轮后继续透明转发。SCADA 默认保持持久 Modbus/TCP 连接。
-
-## 运行
+在仓库根目录激活安装环境，创建独立的本机配置和输出目录：
 
 ```bash
-bash scripts/run_all.sh examples/c_town/config_mitm.yaml
+python -m src.run.prepare_config --config examples/c_town/config_mitm_plc9.yaml \
+  --destination local-configs/mitm-plc8.yaml --output output/v1-mitm-plc8
+bash scripts/run_all.sh local-configs/mitm-plc8.yaml --log-level concise
 ```
 
-## 结果文件
+其他场景使用表中对应的配置文件，并分别指定新的配置副本和输出目录。保留原配置的迭代数和攻击参数，运行至攻击窗口结束。
 
-攻击调度事件：
+## 查看结果
 
-```text
-examples/c_town/output/runtime/csv/attack_schedule.csv
-```
+在 `<output_path>/reports/csv/` 中检查：
 
-攻击篡改事件：
+- `attack_schedule.csv`：代理启动、逐周期攻击状态及结束记录；结束记录的控制周期字段为空。
+- `attack_events.csv`：匹配变量、修改前后的值及事件记录。
+- 水力和 SCADA 结果表：攻击窗口前后观测值及控制结果的变化。
 
-```text
-examples/c_town/output/runtime/csv/attack_events.csv
-```
-
-`attack_schedule.csv` 用来确认攻击脚本在哪一轮启动/停止；`attack_events.csv` 用来确认具体哪些 Modbus 响应被篡改。
-
-## 配置扩展模板
-
-```yaml
-attacks:
-  enabled: true
-  scenarios:
-    - name: mitm_fake_T7
-      enabled: true
-      type: modbus_mitm
-      trigger:
-        type: iteration_window
-        start_iteration: 20
-        end_iteration: 40
-      attacker:
-        endpoint: mitm
-        namespace: ns-attacker
-        ip: 192.168.255.100
-      intercept:
-        source: scada
-        targets: [PLC9]
-        protocol: modbus_tcp
-        port: 502
-        listen_port_base: 15020
-        redirect: iptables_output_dnat
-      rules:
-        - name: replace_plc9_t7_with_high_level
-          target: PLC9
-          variable: PLC9_T7
-          direction: response
-          function_codes: [3]
-          operation: set
-          value: 5.2
-          window:
-            start_after_sec: 0.0
-```
-
-支持的 `operation`：`set`、`add`/`bias`、`multiply`/`scale`。`trigger` 用于按仿真轮次切换攻击 active 状态；`rules[].window` 是攻击代理启动后的墙钟时间窗口，通常保持 `start_after_sec: 0.0` 即可。
-
-## 结果对比
-
-```bash
-python3 scripts/compare_attack_results.py \
-  --baseline examples/c_town/baseline \
-  --attack examples/c_town/output/runtime/csv/physics.csv \
-  --start 20 \
-  --end 40 \
-  --columns PU10 PU11 T7
-```
-
-脚本会输出攻击窗口 `20..40` 内 `PU10`、`PU11`、`T7` 的逐轮差异，并生成：
-
-```text
-examples/c_town/output/runtime/csv/attack_baseline_compare.csv
-examples/c_town/output/runtime/csv/attack_baseline_summary.csv
-```
-
-如果 `runtime/csv` 由 sudo 运行产生且普通用户不可写，脚本会自动改写到：
-
-```text
-examples/c_town/output/check/attack_compare/
-```
+比较无攻击和 MITM 实验时，使用相同的水网模型、初始状态及控制参数，按控制周期关联结果。字段和初始化记录的含义见[输出说明](../../docs/outputs.md)，完整场景运行结果见[检查清单](../../docs/release_checklist.md)。

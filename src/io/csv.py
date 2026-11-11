@@ -16,6 +16,7 @@ Performance note:
 from __future__ import annotations
 
 import csv
+import fcntl
 import json
 import math
 from pathlib import Path
@@ -116,6 +117,22 @@ def _read_all_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
 
 
 def append_row(path: Path, row: dict[str, Any], *, fixed_columns: list[str] | None = None) -> None:
+    """Serialize header inspection, expansion and append across PLC processes.
+
+    Lock a separate stable file so truncating/reopening the CSV during header
+    expansion cannot allow another writer to bypass the lock. Keep the existing
+    columns, cell encoding and append semantics unchanged.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_name(path.name + '.lock').open('a') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            _append_row_locked(path, row, fixed_columns=fixed_columns)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _append_row_locked(path: Path, row: dict[str, Any], *, fixed_columns: list[str] | None = None) -> None:
     """Append one row to a CSV file, expanding the header only when necessary.
 
     Normal case after the first cycle is O(1): read header line, append row.

@@ -50,6 +50,7 @@ def main() -> int:
         "OPENPLC_PATH": str(openplc_path),
         "NS3_PATH": str(ns3_path),
         "ITERATIONS_FROM_CONFIG": str(iterations),
+        "LOG_LEVEL_FROM_CONFIG": str(cfg.get("log_level", "debug")),
     }
     for key, value in values.items():
         print(f"{key}={shlex.quote(value)}")
